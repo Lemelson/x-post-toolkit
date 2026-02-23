@@ -151,8 +151,10 @@ async function runTranscriptJob(tweetId, meta, settings) {
     };
   }
 
-  const media = await resolveBestMp4(tweetId);
-  const transcript = await runNativeTranscription(tweetId, media.url);
+  const candidates = await resolveMp4Candidates(tweetId);
+  const transcriptResult = await transcribeWithFallback(tweetId, candidates);
+  const media = transcriptResult.media;
+  const transcript = transcriptResult.transcript;
 
   await saveTranscriptEntry(
     {
@@ -373,6 +375,41 @@ async function runNativeTranscription(tweetId, mp4Url) {
   };
 }
 
+async function transcribeWithFallback(tweetId, candidates) {
+  let lastError = null;
+
+  for (const media of candidates) {
+    try {
+      const transcript = await runNativeTranscription(tweetId, media.url);
+      return { media, transcript };
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (!isRecoverableAudioError(lastError)) {
+        throw lastError;
+      }
+    }
+  }
+
+  if (lastError) {
+    throw new Error(`No usable audio stream found across MP4 variants. Last error: ${lastError.message}`);
+  }
+  throw new Error("No MP4 candidates available for transcript.");
+}
+
+function isRecoverableAudioError(error) {
+  const text = String(error?.message || "").toLowerCase();
+  if (!text) {
+    return false;
+  }
+
+  return (
+    text.includes("does not contain any stream") ||
+    text.includes("stream specifier") ||
+    text.includes("error opening output file") ||
+    text.includes("invalid argument")
+  );
+}
+
 async function debugNativeHost() {
   try {
     const ping = await sendNativeMessage({ type: "ping" });
@@ -416,6 +453,11 @@ function sendNativeMessage(payload) {
 }
 
 async function resolveBestMp4(tweetId) {
+  const candidates = await resolveMp4Candidates(tweetId);
+  return candidates[0];
+}
+
+async function resolveMp4Candidates(tweetId) {
   const errors = [];
 
   try {
@@ -447,13 +489,12 @@ async function getFromSyndication(tweetId) {
     throw new Error("no MP4 variants in response");
   }
 
-  variants.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  const best = variants[0];
-  return {
-    source: best.source || "cdn.syndication",
-    url: best.url,
-    bitrate: best.bitrate || 0
-  };
+  variants.sort(compareVariantPriority);
+  return variants.map((variant) => ({
+    source: variant.source || "cdn.syndication",
+    url: variant.url,
+    bitrate: variant.bitrate || 0
+  }));
 }
 
 function collectMp4Variants(payload) {
@@ -471,7 +512,8 @@ function collectMp4Variants(payload) {
     result.push({
       url,
       bitrate: Number.isFinite(Number(bitrate)) ? Number(bitrate) : 0,
-      source: source || "cdn.syndication"
+      source: source || "cdn.syndication",
+      rank: sourceRank(source || "cdn.syndication")
     });
   };
 
@@ -541,6 +583,32 @@ function collectMp4Variants(payload) {
       walkForVideoInfo(value, addVariants, addMediaDetails, depth + 1);
     }
   }
+}
+
+function sourceRank(source) {
+  const text = String(source || "").toLowerCase();
+  if (text === "cdn.syndication") {
+    return 0;
+  }
+  if (text.includes(":retweeted")) {
+    return 1;
+  }
+  if (text.includes(":quoted")) {
+    return 2;
+  }
+  if (text.includes(":nested")) {
+    return 3;
+  }
+  return 4;
+}
+
+function compareVariantPriority(a, b) {
+  const ar = Number.isFinite(a?.rank) ? a.rank : sourceRank(a?.source);
+  const br = Number.isFinite(b?.rank) ? b.rank : sourceRank(b?.source);
+  if (ar !== br) {
+    return ar - br;
+  }
+  return (Number(b?.bitrate || 0) - Number(a?.bitrate || 0));
 }
 
 async function getSettings() {

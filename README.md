@@ -31,6 +31,9 @@ Most web downloader tools are external websites. This extension keeps the workfl
   - retention window (default: 3 days / 72 hours)
 - 30-minute per-post transcript cache (no repeated model run)
 - Sequential queue for transcript jobs (if you click multiple posts quickly)
+- Source priority for posts with multiple videos:
+  - primary post video first,
+  - then retweeted/quoted/nested fallbacks.
 - No always-on local server: host process starts only on request and exits after completion
 
 ## Privacy and data handling
@@ -177,7 +180,8 @@ which ffmpeg
 ### `No downloadable MP4 found`
 
 Some posts embed video in quoted/retweeted structures or restrict media delivery.
-This repo already includes fallback parsing for quoted tweet media, but some posts may still be inaccessible due to platform-side constraints.
+This repo prioritizes the main post video and falls back to quoted/retweeted/nested media when needed.
+Some posts may still be inaccessible due to platform-side constraints.
 
 ### `__pycache__` load errors
 
