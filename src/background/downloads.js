@@ -13,12 +13,13 @@ export async function startVideoDownload(context, media) {
   });
 }
 
-export async function startTranscriptDownload(context, text, title) {
+export async function startTranscriptDownload(context, text, title, extension = ".txt") {
   const stem = buildFileStem(context, title || context.title || context.sourceId, null);
+  const ext = extension === ".srt" ? ".srt" : ".txt";
   const url = `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`;
   return chrome.downloads.download({
     url,
-    filename: `${stem}_transcript.txt`,
+    filename: `${stem}_transcript${ext}`,
     conflictAction: "uniquify",
     saveAs: false
   });

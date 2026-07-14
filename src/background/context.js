@@ -23,7 +23,9 @@ export function getItemContext(message) {
   }
 
   const parsed = parseItemId(itemId);
-  const title = buildTitleSnippet(message?.title || message?.tweetText || message?.fileName || "");
+  const titleSource = message?.title || message?.tweetText || message?.fileName || "";
+  const title = buildTitleSnippet(titleSource);
+  const tweetText = buildTweetText(message?.tweetText || "");
 
   return {
     itemId,
@@ -32,6 +34,9 @@ export function getItemContext(message) {
     fileId: driveFileId || deriveDriveFileIdFromItemId(itemId),
     itemUrl: normalizeItemUrl(parsed.platform, parsed.sourceId, rawUrl, driveFileId || deriveDriveFileIdFromItemId(itemId)),
     title,
+    tweetText,
+    authorName: buildTitleSnippet(message?.authorName || ""),
+    authorHandle: normalizeAuthorHandle(message?.authorHandle || ""),
     mediaUrl: normalizeMediaUrl(message?.mediaUrl || "")
   };
 }
@@ -227,6 +232,24 @@ export function buildTitleSnippet(text) {
   }
 
   return normalized.slice(0, 180);
+}
+
+export function buildTweetText(text) {
+  return String(text || "")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .join("\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .slice(0, 5000);
+}
+
+export function normalizeAuthorHandle(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^@?([A-Za-z0-9_]{1,15})$/);
+  return match ? `@${match[1]}` : "";
 }
 
 export function hashString(value) {

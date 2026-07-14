@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Video Toolkit",
-  "version": "0.3.0",
-  "description": "Download videos and generate local transcripts from X and Google Drive.",
+  "name": "X Video Toolkit — Download & Transcribe",
+  "short_name": "X Video Toolkit",
+  "version": "0.4.0",
+  "description": "One-click X/Twitter and Google Drive video downloads with private local NVIDIA Parakeet v3 transcription.",
   "permissions": [
     "downloads",
     "tabs",

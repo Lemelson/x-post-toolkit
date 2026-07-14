@@ -6,6 +6,22 @@ const BTN_CLASS = "xvdl-btn";
 const DRIVE_BTN_CLASS = "xvdl-btn--drive";
 const BTN_ROLE = "xvdl-action";
 const TOAST_CLASS = "xvdl-toast";
+const DEFAULT_MESSAGE_TIMEOUT_MS = 60 * 1000;
+const DEBUG_MESSAGE_TIMEOUT_MS = 15 * 1000;
+const TRANSCRIPT_MESSAGE_TIMEOUT_MS = 135 * 60 * 1000;
+// Keep the current stage visible for the same window as the request. Success,
+// failure, or the request timeout replaces it with a terminal toast.
+const PROGRESS_TOAST_DURATION_MS = TRANSCRIPT_MESSAGE_TIMEOUT_MS;
+
+const PROGRESS_TOASTS = {
+  downloading: { text: "Downloading audio…", kind: "info" },
+  downloaded: { text: "Audio downloaded", kind: "step" },
+  transcribing: { text: "Audio verified. Transcribing…", kind: "work" },
+  "invalid-cache": { text: "Cached transcript is incomplete or unverified. Starting again…", kind: "step" },
+  "retrying-download": { text: "Audio download was interrupted. Retrying…", kind: "step" },
+  "retrying-transcription": { text: "Transcription was interrupted. Retrying…", kind: "step" }
+};
+let progressTransitionTimer = null;
 
 const adapterApi = {
   ACTIONS_CLASS,
@@ -27,8 +43,9 @@ scanPage();
 observeDom();
 wireClickHandler();
 wireRuntimeHandler();
-observeRouteChanges();
-setInterval(() => scanPage(), 1500);
+// Safety net for anything the MutationObserver misses (e.g. attribute-only
+// player swaps); the observer handles the common cases, so keep this rare.
+setInterval(() => scheduleScan(), 5000);
 
 function injectStyles() {
   if (document.getElementById("xvdl-style")) {
@@ -165,6 +182,15 @@ function injectStyles() {
     .${TOAST_CLASS}[data-kind="success"] {
       border: 1px solid rgba(0, 186, 124, 0.45);
     }
+    .${TOAST_CLASS}[data-kind="info"] {
+      border: 1px solid rgba(29, 155, 240, 0.6);
+    }
+    .${TOAST_CLASS}[data-kind="step"] {
+      border: 1px solid rgba(255, 179, 0, 0.65);
+    }
+    .${TOAST_CLASS}[data-kind="work"] {
+      border: 1px solid rgba(157, 101, 255, 0.65);
+    }
   `;
   document.documentElement.appendChild(style);
 }
@@ -185,14 +211,27 @@ function scanPage(root = document) {
   }
 }
 
+// SPA mutations arrive in bursts (X re-renders whole timeline chunks), so
+// coalesce them into one scan per animation frame instead of scanning per node.
+let scanQueued = false;
+
+function scheduleScan() {
+  if (scanQueued) {
+    return;
+  }
+  scanQueued = true;
+  window.requestAnimationFrame(() => {
+    scanQueued = false;
+    scanPage();
+  });
+}
+
 function observeDom() {
   const observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
-      for (const node of mutation.addedNodes) {
-        if (!(node instanceof Element)) {
-          continue;
-        }
-        scanPage(node);
+      if (mutation.addedNodes.length) {
+        scheduleScan();
+        return;
       }
     }
   });
@@ -201,17 +240,6 @@ function observeDom() {
     childList: true,
     subtree: true
   });
-}
-
-function observeRouteChanges() {
-  let lastUrl = location.href;
-  setInterval(() => {
-    if (location.href === lastUrl) {
-      return;
-    }
-    lastUrl = location.href;
-    scanPage();
-  }, 700);
 }
 
 function createActionWrapper(meta, variant, adapterId) {
@@ -254,6 +282,9 @@ function applyMetaToButton(button, meta, adapterId = "") {
   button.dataset.itemId = meta.itemId || "";
   button.dataset.itemUrl = meta.itemUrl || "";
   button.dataset.title = meta.title || "";
+  button.dataset.tweetText = meta.tweetText || "";
+  button.dataset.authorName = meta.authorName || "";
+  button.dataset.authorHandle = meta.authorHandle || "";
   button.dataset.platform = meta.platform || "";
   button.dataset.mediaUrl = meta.mediaUrl || "";
   button.dataset.fileId = meta.fileId || "";
@@ -285,6 +316,9 @@ function wireClickHandler() {
       itemId,
       itemUrl: meta.itemUrl || button.dataset.itemUrl || location.href,
       title: meta.title || button.dataset.title || "",
+      tweetText: meta.tweetText || button.dataset.tweetText || "",
+      authorName: meta.authorName || button.dataset.authorName || "",
+      authorHandle: meta.authorHandle || button.dataset.authorHandle || "",
       platform: meta.platform || button.dataset.platform || "",
       mediaUrl: meta.mediaUrl || button.dataset.mediaUrl || "",
       fileId: meta.fileId || button.dataset.fileId || ""
@@ -299,54 +333,71 @@ function wireClickHandler() {
       itemId,
       itemUrl: payload.itemUrl,
       title: payload.title,
+      tweetText: payload.tweetText,
+      authorName: payload.authorName,
+      authorHandle: payload.authorHandle,
       platform: payload.platform,
       mediaUrl: payload.mediaUrl,
       fileId: payload.fileId
     }, button.dataset.adapterId || "");
 
     setState(button, action, "loading");
-    chrome.runtime.sendMessage(payload, async (response) => {
-      if (chrome.runtime.lastError) {
-        setState(button, action, "error");
-        const msg = `Failed: ${chrome.runtime.lastError.message}`;
-        button.title = msg;
-        showToast(msg, "error");
-        resetLater(button, action);
-        return;
-      }
+    if (action === "transcript") {
+      showProgressToast("downloading");
+    }
+    sendRuntimeMessage(payload)
+      .then(async (response) => {
+        if (!response?.ok) {
+          setState(button, action, "error");
+          const code = response?.code ? ` [${response.code}]` : "";
+          const msg = `Failed${code}: ${response?.error || "unknown error"}\nLog: ~/Library/Logs/xvdl-native-host.log`;
+          button.title = msg;
+          showToast(msg, "error");
+          resetLater(button, action);
+          return;
+        }
 
-      if (!response?.ok) {
-        setState(button, action, "error");
-        const msg = `Failed: ${response?.error || "unknown error"}`;
-        button.title = msg;
-        showToast(msg, "error");
-        resetLater(button, action);
-        return;
-      }
-
-      setState(button, action, "done");
-      if (action === "transcript") {
-        if (response.cached) {
-          const ttlMin = Math.max(1, Math.ceil(Number(response.cacheTtlSec || 0) / 60));
-          try {
-            await copyTextToClipboard(response.text || "");
-            button.title = "Cached transcript copied to clipboard";
-            showToast(`Cached transcript copied to clipboard. Cache active for ~${ttlMin} min.`, "success");
-          } catch (error) {
-            setState(button, action, "error");
-            const msg = `Transcript is cached, but clipboard copy failed: ${error instanceof Error ? error.message : String(error)}`;
-            button.title = msg;
-            showToast(msg, "error");
+        setState(button, action, "done");
+        if (action === "transcript") {
+          if (response.cached) {
+            try {
+              await copyTextToClipboard(response.text || "");
+              button.title = "Cached transcript copied to clipboard";
+              showToast(
+                `Verified saved transcript copied. Kept for ${formatRemainingDuration(response.cacheTtlSec)}.`,
+                "success"
+              );
+            } catch (error) {
+              setState(button, action, "error");
+              const msg = `Transcript is cached, but clipboard copy failed: ${error instanceof Error ? error.message : String(error)}`;
+              button.title = msg;
+              showToast(msg, "error");
+            }
+          } else {
+            try {
+              await copyTextToClipboard(response.text || "");
+              button.title = "Transcript copied to clipboard";
+              showToast("Full transcript verified, saved, and copied to clipboard", "success");
+            } catch (error) {
+              setState(button, action, "error");
+              const msg = `Transcript is saved, but clipboard copy failed: ${error instanceof Error ? error.message : String(error)}`;
+              button.title = msg;
+              showToast(msg, "error");
+            }
           }
         } else {
-          button.title = "Transcript copied to clipboard";
-          showToast("Transcript copied to clipboard", "success");
+          button.title = `Downloading... (${response.source})`;
+          showToast(`Download started (${response.source})`, "success");
         }
-      } else {
-        button.title = `Downloading... (${response.source})`;
-      }
-      resetLater(button, action);
-    });
+        resetLater(button, action);
+      })
+      .catch((error) => {
+        setState(button, action, "error");
+        const msg = `Failed: ${error instanceof Error ? error.message : String(error)}`;
+        button.title = msg;
+        showToast(msg, "error");
+        resetLater(button, action);
+      });
   });
 }
 
@@ -394,27 +445,31 @@ async function copyTextToClipboard(text) {
 
 function runDebug(button, action) {
   setState(button, action, "loading");
-  chrome.runtime.sendMessage({ type: "DEBUG_NATIVE_HOST" }, (response) => {
-    if (chrome.runtime.lastError) {
-      const msg = `Debug failed: ${chrome.runtime.lastError.message}`;
+  sendRuntimeMessage({ type: "DEBUG_NATIVE_HOST" }, DEBUG_MESSAGE_TIMEOUT_MS)
+    .then((response) => {
+      setState(button, action, response?.ok ? "done" : "error");
+      const text = response?.ok
+        ? `Native host OK\nextensionId: ${response.extensionId}\nmodel: ${response.ping?.model || "unknown"}`
+        : `Native host FAIL\nextensionId: ${response?.extensionId || "unknown"}\n${response?.error || "unknown error"}`;
+      showToast(text, response?.ok ? "success" : "error", 14000);
+      resetLater(button, action);
+    })
+    .catch((error) => {
+      const msg = `Debug failed: ${error instanceof Error ? error.message : String(error)}`;
       setState(button, action, "error");
       button.title = msg;
       showToast(msg, "error", 12000);
       resetLater(button, action);
-      return;
-    }
-
-    setState(button, action, response?.ok ? "done" : "error");
-    const text = response?.ok
-      ? `Native host OK\nextensionId: ${response.extensionId}\nmodel: ${response.ping?.model || "unknown"}`
-      : `Native host FAIL\nextensionId: ${response?.extensionId || "unknown"}\n${response?.error || "unknown error"}`;
-    showToast(text, response?.ok ? "success" : "error", 14000);
-    resetLater(button, action);
-  });
+    });
 }
 
 function wireRuntimeHandler() {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "XVDL_PROGRESS") {
+      showProgressToast(message.stage, message);
+      return;
+    }
+
     if (!message || (message.type !== "GET_VISIBLE_VIDEO_CONTEXT" && message.type !== "GET_VISIBLE_VIDEO_TWEET")) {
       return;
     }
@@ -425,6 +480,9 @@ function wireRuntimeHandler() {
       itemId: meta?.itemId || null,
       itemUrl: meta?.itemUrl || null,
       title: meta?.title || "",
+      tweetText: meta?.tweetText || "",
+      authorName: meta?.authorName || "",
+      authorHandle: meta?.authorHandle || "",
       platform: meta?.platform || "",
       mediaUrl: meta?.mediaUrl || "",
       fileId: meta?.fileId || ""
@@ -443,6 +501,9 @@ function getVisibleVideoContext() {
     itemId: null,
     itemUrl: null,
     title: "",
+    tweetText: "",
+    authorName: "",
+    authorHandle: "",
     platform: "",
     mediaUrl: "",
     fileId: ""
@@ -482,6 +543,20 @@ function getButtonTitle(action) {
   return action === "transcript" ? "Transcribe and copy" : "Download video";
 }
 
+function formatRemainingDuration(seconds) {
+  const value = Math.max(0, Number(seconds || 0));
+  if (value >= 24 * 60 * 60) {
+    const days = Math.max(1, Math.ceil(value / (24 * 60 * 60)));
+    return `~${days} ${days === 1 ? "day" : "days"}`;
+  }
+  if (value >= 60 * 60) {
+    const hours = Math.max(1, Math.ceil(value / (60 * 60)));
+    return `~${hours} ${hours === 1 ? "hour" : "hours"}`;
+  }
+  const minutes = Math.max(1, Math.ceil(value / 60));
+  return `~${minutes} min`;
+}
+
 function resetLater(button, action) {
   window.setTimeout(() => {
     setState(button, action, "idle");
@@ -489,7 +564,34 @@ function resetLater(button, action) {
   }, 2400);
 }
 
+function showProgressToast(stage, details = {}) {
+  const toast = PROGRESS_TOASTS[String(stage || "")];
+  if (!toast) {
+    return;
+  }
+  const attempt = Number(details.attempt || 0);
+  const maxAttempts = Number(details.maxAttempts || 0);
+  const suffix = attempt > 1 && maxAttempts > 1 ? ` (${attempt}/${maxAttempts})` : "";
+  const text = `${toast.text}${suffix}`;
+
+  if (stage === "transcribing") {
+    window.clearTimeout(progressTransitionTimer);
+    progressTransitionTimer = window.setTimeout(() => {
+      progressTransitionTimer = null;
+      showToast(text, toast.kind, PROGRESS_TOAST_DURATION_MS);
+    }, 700);
+    return;
+  }
+
+  showToast(text, toast.kind, PROGRESS_TOAST_DURATION_MS);
+}
+
 function showToast(text, kind = "error", durationMs = 6000) {
+  if (progressTransitionTimer !== null) {
+    window.clearTimeout(progressTransitionTimer);
+    progressTransitionTimer = null;
+  }
+
   const existing = document.querySelector(`.${TOAST_CLASS}`);
   if (existing) {
     existing.remove();
@@ -506,4 +608,59 @@ function showToast(text, kind = "error", durationMs = 6000) {
       toast.remove();
     }
   }, durationMs);
+}
+
+function sendRuntimeMessage(payload, timeoutMs = getRuntimeMessageTimeoutMs(payload?.type)) {
+  const timeout = sanitizeTimeout(timeoutMs, DEFAULT_MESSAGE_TIMEOUT_MS);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(new Error(buildRuntimeTimeoutMessage(payload?.type, timeout)));
+    }, timeout);
+
+    chrome.runtime.sendMessage(payload, (response) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      window.clearTimeout(timer);
+
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+
+      resolve(response);
+    });
+  });
+}
+
+function getRuntimeMessageTimeoutMs(type) {
+  return type === "TRANSCRIBE_VIDEO_ITEM" ? TRANSCRIPT_MESSAGE_TIMEOUT_MS : DEFAULT_MESSAGE_TIMEOUT_MS;
+}
+
+function sanitizeTimeout(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    return fallback;
+  }
+  return Math.floor(n);
+}
+
+function buildRuntimeTimeoutMessage(type, timeoutMs) {
+  const action = type === "TRANSCRIBE_VIDEO_ITEM" ? "transcription" : "extension action";
+  return `${action} did not respond within ${formatDuration(timeoutMs)}. The local transcriber may be stuck; check the extension/native-host log and retry.`;
+}
+
+function formatDuration(ms) {
+  const sec = Math.max(1, Math.ceil(Number(ms || 0) / 1000));
+  if (sec < 60) {
+    return `${sec}s`;
+  }
+  return `${Math.ceil(sec / 60)} min`;
 }

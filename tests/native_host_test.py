@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -37,6 +38,129 @@ class NativeHostUrlValidationTest(unittest.TestCase):
     self.assertNotIn("https://video.twimg.com/private.mp4", text)
     self.assertIn("[media-url]", text)
     self.assertIn("invalid argument", text)
+
+  def test_progress_message_includes_stage_timing(self):
+    with mock.patch.object(native_host, "send_message") as send_message:
+      native_host.send_progress("x:12345678", "downloaded", downloadElapsedMs=1250)
+
+    send_message.assert_called_once_with({
+      "ok": True,
+      "type": "progress",
+      "stage": "downloaded",
+      "itemId": "x:12345678",
+      "downloadElapsedMs": 1250,
+    })
+
+  def test_rejects_truncated_audio_and_transcript_coverage(self):
+    self.assertTrue(native_host.is_audio_duration_complete(1081466, 1081514))
+    self.assertFalse(native_host.is_audio_duration_complete(1081466, 65000))
+    self.assertTrue(native_host.is_transcript_coverage_complete(1081514, 1079520, 18814))
+    self.assertFalse(native_host.is_transcript_coverage_complete(1081514, 65000, 1257))
+    self.assertFalse(native_host.is_transcript_coverage_complete(1081514, 0, 0))
+
+  def test_retries_incomplete_download_and_transcription_before_success(self):
+    with (
+      mock.patch.object(native_host, "resolve_executable", return_value="/tmp/ffmpeg"),
+      mock.patch.object(native_host, "run_cmd") as run_cmd,
+      mock.patch.object(native_host, "wav_duration_ms", side_effect=[65000, 1081514]),
+      mock.patch.object(
+        native_host,
+        "call_spokenly",
+        side_effect=[
+          ("x" * 1257, 65000, []),
+          ("x" * 18814, 1079520, [{"text": "x" * 18814, "startMs": 0, "endMs": 1079520}]),
+        ],
+      ),
+      mock.patch.object(native_host, "send_progress") as send_progress,
+      mock.patch.object(native_host.time, "sleep"),
+    ):
+      result = native_host.transcribe(
+        "x:12345678",
+        "https://video.twimg.com/file.mp4",
+        False,
+        emit_progress=True,
+        expected_duration_ms=1081466,
+      )
+
+    stages = [call.args[1] for call in send_progress.call_args_list]
+    command_stages = [call.kwargs["stage"] for call in run_cmd.call_args_list]
+    self.assertEqual(command_stages, ["ffmpeg", "ffmpeg"])
+    self.assertIn("retrying-download", stages)
+    self.assertIn("retrying-transcription", stages)
+    self.assertTrue(result["complete"])
+    self.assertEqual(result["audioDurationMs"], 1081514)
+    self.assertEqual(result["transcriptEndMs"], 1079520)
+    self.assertEqual(len(result["sentences"]), 1)
+    self.assertEqual(result["sentences"][0]["endMs"], 1079520)
+
+  def test_read_exact_reassembles_partial_pipe_reads(self):
+    chunks = [b"\x0f\x00", b"\x00\x00", b'{"type"', b':"ping"}']
+
+    def fake_read(_fd, _length):
+      return chunks.pop(0) if chunks else b""
+
+    with mock.patch.object(native_host.os, "read", side_effect=fake_read):
+      message = native_host.read_message()
+
+    self.assertEqual(message, {"type": "ping"})
+
+  def test_write_all_retries_partial_pipe_writes(self):
+    writes = []
+
+    def fake_write(_fd, data):
+      chunk = bytes(data[:3])
+      writes.append(chunk)
+      return len(chunk)
+
+    with mock.patch.object(native_host.os, "write", side_effect=fake_write):
+      native_host.write_all(1, b"abcdefgh")
+
+    self.assertEqual(b"".join(writes), b"abcdefgh")
+
+  def test_read_message_returns_none_on_eof(self):
+    with mock.patch.object(native_host.os, "read", return_value=b""):
+      self.assertIsNone(native_host.read_message())
+
+  def test_parse_spokenly_transcript_collects_sentences(self):
+    payload = {
+      "modelId": "parakeetTDT06",
+      "segments": [
+        {"text": "Hello", "start": 0.0, "end": 1.0},
+        {"text": "there.", "start": 1.0, "end": 3.5},
+        {"text": "Second", "start": 4.0, "end": 5.0},
+        {"text": "part!", "start": 5.0, "end": 7.25},
+        {"text": "", "start": 8.0, "end": 9.0},
+      ],
+    }
+
+    transcript, end_ms, sentences = native_host.parse_spokenly_transcript(payload)
+
+    self.assertEqual(transcript, "Hello there. Second part!")
+    self.assertEqual(end_ms, 7250)
+    self.assertEqual(
+      sentences,
+      [
+        {"text": "Hello there.", "startMs": 0, "endMs": 3500},
+        {"text": "Second part!", "startMs": 4000, "endMs": 7250},
+      ],
+    )
+
+  def test_parse_spokenly_transcript_rejects_other_models(self):
+    with self.assertRaisesRegex(native_host.SpokenlyResponseError, "parakeetTDT06"):
+      native_host.parse_spokenly_transcript({"modelId": "cloud-model", "segments": []})
+
+  def test_parse_spokenly_transcript_accepts_structured_model_id(self):
+    transcript, _, _ = native_host.parse_spokenly_transcript({
+      "modelId": {"predefined": "parakeetTDT06"},
+      "segments": [{"text": "Hello.", "start": 0, "end": 1}],
+    })
+    self.assertEqual(transcript, "Hello.")
+
+  def test_spokenly_url_must_be_loopback(self):
+    native_host.validate_spokenly_url("http://127.0.0.1:51089")
+    native_host.validate_spokenly_url("http://[::1]:51089")
+    with self.assertRaisesRegex(native_host.SpokenlyUnavailableError, "loopback"):
+      native_host.validate_spokenly_url("https://example.com/transcribe")
 
 
 if __name__ == "__main__":

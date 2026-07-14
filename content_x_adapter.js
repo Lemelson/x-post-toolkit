@@ -176,6 +176,9 @@
         itemId: null,
         itemUrl: null,
         title: "",
+        tweetText: "",
+        authorName: "",
+        authorHandle: "",
         platform: "x",
         mediaUrl: "",
         fileId: ""
@@ -184,19 +187,38 @@
 
     function extractTweetMeta(tweetEl) {
       if (!(tweetEl instanceof Element)) {
-        return { itemId: null, itemUrl: null, title: "", platform: "x", mediaUrl: "", fileId: "" };
+        return emptyTweetMeta();
       }
 
       const sourceId = extractTweetSourceId(tweetEl);
-      const title = extractTweetText(tweetEl);
+      const tweetText = extractTweetText(tweetEl);
+      const author = extractTweetAuthor(tweetEl);
+      const title = tweetText;
       if (!sourceId) {
-        return { itemId: null, itemUrl: null, title, platform: "x", mediaUrl: "", fileId: "" };
+        return { ...emptyTweetMeta(), title, tweetText, ...author };
       }
 
       return {
         itemId: `${ITEM_PREFIX_X}${sourceId}`,
         itemUrl: makeTweetUrl(sourceId),
         title,
+        tweetText,
+        authorName: author.authorName,
+        authorHandle: author.authorHandle,
+        platform: "x",
+        mediaUrl: "",
+        fileId: ""
+      };
+    }
+
+    function emptyTweetMeta() {
+      return {
+        itemId: null,
+        itemUrl: null,
+        title: "",
+        tweetText: "",
+        authorName: "",
+        authorHandle: "",
         platform: "x",
         mediaUrl: "",
         fileId: ""
@@ -225,20 +247,69 @@
     }
 
     function extractTweetText(tweetEl) {
-      const textNode = tweetEl.querySelector('[data-testid="tweetText"]');
-      if (!textNode) {
+      const textNodes = Array.from(tweetEl.querySelectorAll('[data-testid="tweetText"]'))
+        .filter((node) => {
+          const parentTweetText = node.parentElement?.closest?.('[data-testid="tweetText"]');
+          return parentTweetText === null;
+        });
+      if (!textNodes.length) {
         return "";
       }
 
-      const raw = typeof textNode.innerText === "string" && textNode.innerText
-        ? textNode.innerText
-        : textNode.textContent || "";
+      const parts = [];
+      for (const node of textNodes) {
+        const raw = typeof node.innerText === "string" && node.innerText
+          ? node.innerText
+          : node.textContent || "";
+        const text = normalizeText(raw);
+        if (text) {
+          parts.push(text);
+        }
+      }
 
-      return String(raw)
+      return dedupeConsecutive(parts).join("\n\n").slice(0, 5000);
+    }
+
+    function extractTweetAuthor(tweetEl) {
+      const userName = tweetEl.querySelector('[data-testid="User-Name"]');
+      if (!userName) {
+        return { authorName: "", authorHandle: "" };
+      }
+
+      const raw = typeof userName.innerText === "string" && userName.innerText
+        ? userName.innerText
+        : userName.textContent || "";
+      const lines = normalizeText(raw).split("\n").map((line) => line.trim()).filter(Boolean);
+      const authorHandle = lines.find((line) => /^@[A-Za-z0-9_]{1,15}$/.test(line)) || "";
+      const authorName = lines.find((line) => {
+        return line &&
+          line !== authorHandle &&
+          line !== "·" &&
+          !/^@[A-Za-z0-9_]{1,15}$/.test(line) &&
+          !/^\d+[smhdw]$/.test(line);
+      }) || "";
+
+      return { authorName, authorHandle };
+    }
+
+    function normalizeText(value) {
+      return String(value || "")
         .replace(/\r/g, "\n")
-        .replace(/[ \t]+/g, " ")
+        .replace(/[ \t\f\v]+/g, " ")
+        .replace(/[ \t]*\n[ \t]*/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
         .trim()
-        .slice(0, 600);
+        .replace(/[ \t]+([.,!?;:])/g, "$1");
+    }
+
+    function dedupeConsecutive(parts) {
+      const result = [];
+      for (const part of parts) {
+        if (part && part !== result[result.length - 1]) {
+          result.push(part);
+        }
+      }
+      return result;
     }
 
     function makeTweetUrl(tweetId) {

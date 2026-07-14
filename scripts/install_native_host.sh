@@ -7,20 +7,24 @@ INSTALL_DIR="$HOME/.local/share/xvdl"
 BIN_DIR="$HOME/.local/bin"
 HOST_SCRIPT_SRC="$PROJECT_DIR/scripts/native_host.py"
 HOST_SCRIPT_DST="$INSTALL_DIR/native_host.py"
+COMPAT_SCRIPT_SRC="$PROJECT_DIR/scripts/spokenly_parakeet_compat.py"
+COMPAT_SCRIPT_DST="$INSTALL_DIR/spokenly_parakeet_compat.py"
+COMPAT_WRAPPER_PATH="$BIN_DIR/parakeet-mlx"
 WRAPPER_PATH="$BIN_DIR/xvdl-native-host"
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
 FFMPEG_BIN="${FFMPEG_BIN:-$(command -v ffmpeg || true)}"
-PARAKEET_BIN="${PARAKEET_BIN:-$(command -v parakeet-mlx || true)}"
 
 detect_extension_ids() {
   python3 - "$PROJECT_DIR" <<'PY'
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 project = os.path.realpath(sys.argv[1])
 bases = [
+    Path.home() / "Library/Application Support/net.imput.helium",
     Path.home() / "Library/Application Support/Comet",
     Path.home() / "Library/Application Support/Google/Chrome",
     Path.home() / "Library/Application Support/Arc/User Data",
@@ -29,6 +33,18 @@ bases = [
     Path.home() / "Library/Application Support/Vivaldi",
     Path.home() / "Library/Application Support/Chromium",
     Path.home() / "Library/Application Support/com.operasoftware.Opera",
+]
+native_host_dirs = [
+    Path.home() / "Library/Application Support/net.imput.helium/NativeMessagingHosts",
+    Path.home() / "Library/Application Support/Comet/NativeMessagingHosts",
+    Path.home() / "Library/Application Support/Comet/User Data/NativeMessagingHosts",
+    Path.home() / "Library/Application Support/Google/Chrome/NativeMessagingHosts",
+    Path.home() / "Library/Application Support/Arc/User Data/NativeMessagingHosts",
+    Path.home() / "Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts",
+    Path.home() / "Library/Application Support/Microsoft Edge/NativeMessagingHosts",
+    Path.home() / "Library/Application Support/Vivaldi/NativeMessagingHosts",
+    Path.home() / "Library/Application Support/Chromium/NativeMessagingHosts",
+    Path.home() / "Library/Application Support/com.operasoftware.Opera/NativeMessagingHosts",
 ]
 
 ids = set()
@@ -52,6 +68,20 @@ for base in bases:
             except Exception:
                 pass
 
+# Preserve origins already installed for other browser profiles. Re-running the
+# installer for one browser must not revoke native-host access for the others.
+origin_re = re.compile(r"^chrome-extension://([a-p]{32})/$")
+for directory in native_host_dirs:
+    manifest_path = directory / "com.xvdl.transcriber.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    for origin in manifest.get("allowed_origins") or []:
+        match = origin_re.fullmatch(str(origin))
+        if match:
+            ids.add(match.group(1))
+
 for ext_id in sorted(ids):
     print(ext_id)
 PY
@@ -62,6 +92,7 @@ collect_native_host_dirs() {
 from pathlib import Path
 
 dirs = [
+    Path.home() / "Library/Application Support/net.imput.helium/NativeMessagingHosts",
     Path.home() / "Library/Application Support/Comet/NativeMessagingHosts",
     Path.home() / "Library/Application Support/Comet/User Data/NativeMessagingHosts",
     Path.home() / "Library/Application Support/Google/Chrome/NativeMessagingHosts",
@@ -79,17 +110,24 @@ PY
 }
 
 EXTENSION_IDS=()
-if [[ $# -gt 0 ]]; then
-  for arg in "$@"; do
-    [[ -n "$arg" ]] && EXTENSION_IDS+=("$arg")
-  done
-fi
 
-if [[ ${#EXTENSION_IDS[@]} -eq 0 ]]; then
-  while IFS= read -r id; do
-    [[ -n "$id" ]] && EXTENSION_IDS+=("$id")
-  done < <(detect_extension_ids)
-fi
+append_extension_id() {
+  local candidate="$1"
+  local existing
+  [[ -z "$candidate" ]] && return
+  for existing in "${EXTENSION_IDS[@]-}"; do
+    [[ "$existing" == "$candidate" ]] && return
+  done
+  EXTENSION_IDS+=("$candidate")
+}
+
+for arg in "$@"; do
+  append_extension_id "$arg"
+done
+
+while IFS= read -r id; do
+  append_extension_id "$id"
+done < <(detect_extension_ids)
 
 if [[ ${#EXTENSION_IDS[@]} -eq 0 ]]; then
   cat >&2 <<EOF
@@ -103,13 +141,26 @@ fi
 mkdir -p "$INSTALL_DIR" "$BIN_DIR"
 cp "$HOST_SCRIPT_SRC" "$HOST_SCRIPT_DST"
 chmod +x "$HOST_SCRIPT_DST"
+cp "$COMPAT_SCRIPT_SRC" "$COMPAT_SCRIPT_DST"
+chmod +x "$COMPAT_SCRIPT_DST"
+
+if [[ ! -e "$COMPAT_WRAPPER_PATH" && ! -L "$COMPAT_WRAPPER_PATH" ]] || \
+   grep -qF "$COMPAT_SCRIPT_DST" "$COMPAT_WRAPPER_PATH" 2>/dev/null; then
+  cat >"$COMPAT_WRAPPER_PATH" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${PYTHON_BIN}" -B "${COMPAT_SCRIPT_DST}" "\$@"
+EOF
+  chmod +x "$COMPAT_WRAPPER_PATH"
+else
+  echo "Preserved existing command: $COMPAT_WRAPPER_PATH"
+fi
 
 cat >"$WRAPPER_PATH" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export PATH="\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export XVDL_FFMPEG_BIN="${FFMPEG_BIN:-ffmpeg}"
-export XVDL_PARAKEET_BIN="${PARAKEET_BIN:-parakeet-mlx}"
 exec "${PYTHON_BIN}" -B "${HOST_SCRIPT_DST}"
 EOF
 chmod +x "$WRAPPER_PATH"

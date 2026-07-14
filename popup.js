@@ -18,14 +18,24 @@ const clearHistoryBtn = document.getElementById("clearHistoryBtn");
 const historyLimitInput = document.getElementById("historyLimit");
 const retentionValueInput = document.getElementById("retentionValue");
 const retentionUnitSelect = document.getElementById("retentionUnit");
+const includeTitleInput = document.getElementById("includeTitleInput");
+const timestampModeSelect = document.getElementById("timestampModeSelect");
 const saveSettingsBtn = document.getElementById("saveSettingsBtn");
+
+const DEFAULT_MESSAGE_TIMEOUT_MS = 30 * 1000;
+const TRANSCRIPT_MESSAGE_TIMEOUT_MS = 135 * 60 * 1000;
+const DOWNLOAD_MESSAGE_TIMEOUT_MS = 60 * 1000;
 
 let currentItemId = null;
 let currentItemUrl = null;
 let currentItemTitle = "";
+let currentTweetText = "";
+let currentAuthorName = "";
+let currentAuthorHandle = "";
 let currentPlatform = "";
 let currentMediaUrl = "";
 let currentFileId = "";
+let hasCurrentTranscript = false;
 let isBusy = false;
 
 boot();
@@ -49,21 +59,28 @@ function bindEvents() {
         itemId: currentItemId,
         itemUrl: currentItemUrl || "",
         title: currentItemTitle || "",
+        tweetText: currentTweetText || "",
+        authorName: currentAuthorName || "",
+        authorHandle: currentAuthorHandle || "",
         platform: currentPlatform || "",
         mediaUrl: currentMediaUrl || "",
         fileId: currentFileId || ""
       });
 
       if (!response?.ok) {
-        throw new Error(response?.error || "Transcription failed.");
+        const code = response?.code ? ` [${response.code}]` : "";
+        throw new Error(`${response?.error || "Transcription failed."}${code}`);
       }
 
       if (response.cached) {
-        const ttlMin = Math.max(1, Math.ceil(Number(response.cacheTtlSec || 0) / 60));
         await copyTextToClipboard(response.text || "");
-        setStatus(`Cached transcript copied to clipboard. Cache still active for ~${ttlMin} min.`, "good");
+        setStatus(
+          `Verified saved transcript copied. Kept for ${formatRemainingDuration(response.cacheTtlSec)}.`,
+          "good"
+        );
       } else {
-        setStatus("Transcript copied to clipboard.", "good");
+        await copyTextToClipboard(response.text || "");
+        setStatus("Full transcript verified, saved, and copied to clipboard.", "good");
       }
 
       await refreshState();
@@ -82,6 +99,9 @@ function bindEvents() {
         itemId: currentItemId,
         itemUrl: currentItemUrl || "",
         title: currentItemTitle || "",
+        tweetText: currentTweetText || "",
+        authorName: currentAuthorName || "",
+        authorHandle: currentAuthorHandle || "",
         platform: currentPlatform || "",
         mediaUrl: currentMediaUrl || "",
         fileId: currentFileId || ""
@@ -148,7 +168,9 @@ function bindEvents() {
         type: "UPDATE_TRANSCRIPT_SETTINGS",
         settings: {
           maxItems,
-          retentionHours
+          retentionHours,
+          includeTitle: includeTitleInput.checked,
+          timestampMode: timestampModeSelect.value
         }
       });
 
@@ -181,6 +203,9 @@ async function resolveCurrentItem() {
   currentItemId = resolved.itemId;
   currentItemUrl = resolved.itemUrl || tab.url;
   currentItemTitle = String(resolved.title || "");
+  currentTweetText = String(resolved.tweetText || "");
+  currentAuthorName = String(resolved.authorName || "");
+  currentAuthorHandle = String(resolved.authorHandle || "");
   currentPlatform = resolved.platform || detectPlatformFromId(resolved.itemId);
   currentMediaUrl = String(resolved.mediaUrl || "");
   currentFileId = String(resolved.fileId || "");
@@ -194,6 +219,9 @@ function clearCurrentItem(text) {
   currentItemId = null;
   currentItemUrl = null;
   currentItemTitle = "";
+  currentTweetText = "";
+  currentAuthorName = "";
+  currentAuthorHandle = "";
   currentPlatform = "";
   currentMediaUrl = "";
   currentFileId = "";
@@ -216,18 +244,29 @@ async function refreshState() {
   renderSettings(state.settings || {});
   renderHistory(state.history || []);
 
+  hasCurrentTranscript = !!state.current;
+  transcribeBtn.textContent = hasCurrentTranscript ? "Copy Existing Transcript" : "Transcript Current";
+  applyButtonAvailability();
+}
+
+function applyButtonAvailability() {
   transcribeBtn.disabled = !currentItemId || isBusy;
   downloadVideoBtn.disabled = !currentItemId || isBusy;
-  downloadTxtBtn.disabled = !currentItemId || !state.current || isBusy;
+  downloadTxtBtn.disabled = !currentItemId || !hasCurrentTranscript || isBusy;
   clearHistoryBtn.disabled = isBusy;
   saveSettingsBtn.disabled = isBusy;
 }
 
 function renderSettings(settings) {
   const maxItems = clampInt(settings?.maxItems, 1, 200, 10);
-  const retentionHours = clampInt(settings?.retentionHours, 1, 24 * 30, 72);
+  const retentionHours = clampInt(settings?.retentionHours, 1, 24 * 30, 24 * 7);
 
   historyLimitInput.value = String(maxItems);
+  includeTitleInput.checked = settings?.includeTitle !== false;
+
+  const mode = String(settings?.timestampMode || "off");
+  const knownMode = Array.from(timestampModeSelect.options).some((option) => option.value === mode);
+  timestampModeSelect.value = knownMode ? mode : "off";
 
   if (retentionHours % 24 === 0) {
     retentionValueInput.value = String(Math.max(1, Math.floor(retentionHours / 24)));
@@ -280,23 +319,40 @@ function renderHistory(items) {
 
     const copyBtn = document.createElement("button");
     copyBtn.textContent = "Copy";
-    copyBtn.addEventListener("click", () => copyHistoryItem(item.itemId, item.itemUrl, item.platform));
+    copyBtn.title = "Copy transcript (uses your output settings)";
+    copyBtn.addEventListener("click", () => copyHistoryItem(item.itemId, item.itemUrl, item.platform, "default"));
+    actions.appendChild(copyBtn);
+
+    if (item.hasTimestamps) {
+      const tsBtn = document.createElement("button");
+      tsBtn.textContent = "⏱ Copy";
+      tsBtn.title = "Copy transcript with timecodes";
+      tsBtn.addEventListener("click", () => copyHistoryItem(item.itemId, item.itemUrl, item.platform, "timestamps"));
+      actions.appendChild(tsBtn);
+    }
 
     const txtBtn = document.createElement("button");
     txtBtn.textContent = "TXT";
-    txtBtn.addEventListener("click", () => downloadHistoryItem(item.itemId, item.itemUrl, item.platform));
+    txtBtn.title = "Download .txt (uses your output settings)";
+    txtBtn.addEventListener("click", () => downloadHistoryItem(item.itemId, item.itemUrl, item.platform, "default"));
+    actions.appendChild(txtBtn);
+
+    if (item.hasTimestamps) {
+      const srtBtn = document.createElement("button");
+      srtBtn.textContent = "SRT";
+      srtBtn.title = "Download subtitles (.srt)";
+      srtBtn.addEventListener("click", () => downloadHistoryItem(item.itemId, item.itemUrl, item.platform, "srt"));
+      actions.appendChild(srtBtn);
+    }
 
     const openBtn = document.createElement("button");
     openBtn.textContent = "Open";
     openBtn.addEventListener("click", () => openHistoryItem(item.itemUrl));
+    actions.appendChild(openBtn);
 
     const linkBtn = document.createElement("button");
     linkBtn.textContent = "Link";
     linkBtn.addEventListener("click", () => copyHistoryLink(item.itemUrl));
-
-    actions.appendChild(copyBtn);
-    actions.appendChild(txtBtn);
-    actions.appendChild(openBtn);
     actions.appendChild(linkBtn);
 
     wrapper.appendChild(actions);
@@ -304,36 +360,40 @@ function renderHistory(items) {
   }
 }
 
-async function copyHistoryItem(itemId, itemUrl, platform) {
+async function copyHistoryItem(itemId, itemUrl, platform, format = "default") {
   await runBusyAction(async () => {
     const response = await sendMessage({
       type: "GET_TRANSCRIPT_FOR_ITEM",
       itemId,
       itemUrl: itemUrl || "",
-      platform: platform || detectPlatformFromId(itemId)
+      platform: platform || detectPlatformFromId(itemId),
+      format
     });
     if (!response?.ok) {
       throw new Error(response?.error || "Transcript not found.");
     }
 
     await copyTextToClipboard(response.text || "");
-    setStatus(`Copied transcript for ${formatDisplayId(itemId)}.`, "good");
+    const label = format === "timestamps" ? "timestamped transcript" : "transcript";
+    setStatus(`Copied ${label} for ${formatDisplayId(itemId)}.`, "good");
   });
 }
 
-async function downloadHistoryItem(itemId, itemUrl, platform) {
+async function downloadHistoryItem(itemId, itemUrl, platform, format = "default") {
   await runBusyAction(async () => {
     const response = await sendMessage({
       type: "DOWNLOAD_ITEM_TRANSCRIPT",
       itemId,
       itemUrl: itemUrl || "",
-      platform: platform || detectPlatformFromId(itemId)
+      platform: platform || detectPlatformFromId(itemId),
+      format
     });
     if (!response?.ok) {
       throw new Error(response?.error || "Transcript download failed.");
     }
 
-    setStatus(`Downloading transcript for ${formatDisplayId(itemId)}.`, "good");
+    const label = format === "srt" ? "subtitles" : "transcript";
+    setStatus(`Downloading ${label} for ${formatDisplayId(itemId)}.`, "good");
   });
 }
 
@@ -419,6 +479,9 @@ function extractContextFromUrl(rawUrl) {
       itemId: `${ITEM_PREFIX_DRIVE}${driveId}`,
       itemUrl: url,
       title: "",
+      tweetText: "",
+      authorName: "",
+      authorHandle: "",
       platform: "gdrive",
       mediaUrl: ""
     };
@@ -430,6 +493,9 @@ function extractContextFromUrl(rawUrl) {
       itemId: `${ITEM_PREFIX_X}${tweetId}`,
       itemUrl: makeTweetUrl(tweetId),
       title: "",
+      tweetText: "",
+      authorName: "",
+      authorHandle: "",
       platform: "x",
       mediaUrl: ""
     };
@@ -455,11 +521,7 @@ async function runBusyAction(fn) {
 
 function setBusy(next) {
   isBusy = !!next;
-  transcribeBtn.disabled = isBusy || !currentItemId;
-  downloadVideoBtn.disabled = isBusy || !currentItemId;
-  downloadTxtBtn.disabled = isBusy || !currentItemId;
-  clearHistoryBtn.disabled = isBusy;
-  saveSettingsBtn.disabled = isBusy;
+  applyButtonAvailability();
 }
 
 function setStatus(text, kind = "") {
@@ -503,6 +565,20 @@ function formatDateTime(ts) {
   return new Date(n).toLocaleString();
 }
 
+function formatRemainingDuration(seconds) {
+  const value = Math.max(0, Number(seconds || 0));
+  if (value >= 24 * 60 * 60) {
+    const days = Math.max(1, Math.ceil(value / (24 * 60 * 60)));
+    return `~${days} ${days === 1 ? "day" : "days"}`;
+  }
+  if (value >= 60 * 60) {
+    const hours = Math.max(1, Math.ceil(value / (60 * 60)));
+    return `~${hours} ${hours === 1 ? "hour" : "hours"}`;
+  }
+  const minutes = Math.max(1, Math.ceil(value / 60));
+  return `~${minutes} min`;
+}
+
 function clampInt(value, min, max, fallback) {
   const n = Number(value);
   if (!Number.isFinite(n)) {
@@ -528,5 +604,66 @@ async function askPageForVisibleVideoContext(tabId) {
 }
 
 async function sendMessage(message) {
-  return chrome.runtime.sendMessage(message);
+  const timeout = getRuntimeMessageTimeoutMs(message?.type);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(new Error(buildRuntimeTimeoutMessage(message?.type, timeout)));
+    }, timeout);
+
+    chrome.runtime.sendMessage(message, (response) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+
+      resolve(response);
+    });
+  });
+}
+
+function getRuntimeMessageTimeoutMs(type) {
+  if (
+    type === "TRANSCRIBE_VIDEO_ITEM" ||
+    type === "TRANSCRIBE_TWEET_VIDEO" ||
+    type === "TRANSCRIBE_PAGE_VIDEO"
+  ) {
+    return TRANSCRIPT_MESSAGE_TIMEOUT_MS;
+  }
+
+  if (
+    type === "DOWNLOAD_VIDEO_ITEM" ||
+    type === "DOWNLOAD_TWEET_VIDEO" ||
+    type === "DOWNLOAD_PAGE_VIDEO" ||
+    type === "DOWNLOAD_ITEM_TRANSCRIPT" ||
+    type === "DOWNLOAD_TWEET_TRANSCRIPT"
+  ) {
+    return DOWNLOAD_MESSAGE_TIMEOUT_MS;
+  }
+
+  return DEFAULT_MESSAGE_TIMEOUT_MS;
+}
+
+function buildRuntimeTimeoutMessage(type, timeoutMs) {
+  const action = String(type || "").includes("TRANSCRIBE") ? "Transcription" : "Extension action";
+  return `${action} did not respond within ${formatDuration(timeoutMs)}. The local transcriber may be stuck; check the extension/native-host log and retry.`;
+}
+
+function formatDuration(ms) {
+  const sec = Math.max(1, Math.ceil(Number(ms || 0) / 1000));
+  if (sec < 60) {
+    return `${sec}s`;
+  }
+  return `${Math.ceil(sec / 60)} min`;
 }
