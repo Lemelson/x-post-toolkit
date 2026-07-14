@@ -5,6 +5,10 @@
 [![NVIDIA Parakeet](https://img.shields.io/badge/ASR-NVIDIA%20Parakeet%20v3-76B900?logo=nvidia&logoColor=white)](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+[Website](https://lemelson.github.io/x-post-toolkit/) ·
+[Setup guide](https://lemelson.github.io/x-post-toolkit/setup.html) ·
+[Privacy policy](https://lemelson.github.io/x-post-toolkit/privacy.html)
+
 **X Video Toolkit** is a privacy-first Chrome/Chromium extension that adds
 **Download** and **Transcript** buttons directly to supported X (Twitter) video
 posts and Google Drive video previews.

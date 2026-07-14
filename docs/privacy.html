@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Privacy Policy for X Video Toolkit, a local Chrome extension for downloading and transcribing supported X and Google Drive videos." />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="Privacy Policy — X Video Toolkit" />
+    <meta property="og:description" content="What the extension handles, where it is stored, and what stays local." />
+    <meta property="og:url" content="https://lemelson.github.io/x-post-toolkit/privacy.html" />
+    <meta name="theme-color" content="#f7f7f4" />
+    <link rel="canonical" href="https://lemelson.github.io/x-post-toolkit/privacy.html" />
+    <link rel="stylesheet" href="styles.css" />
+    <title>Privacy Policy — X Video Toolkit</title>
+  </head>
+  <body>
+    <header class="site-header"><nav class="nav" aria-label="Main navigation"><a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 8v8M9 5v14M13 8v8M17 3v18M21 8v8" /></svg></span><span>X Video Toolkit</span></a><button class="menu-button" type="button" aria-label="Toggle navigation" aria-expanded="false" data-menu-button><svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 8h16M4 16h16" /></svg></button><div class="nav-links" data-menu><a href="index.html">Overview</a><a href="setup.html">Setup</a><a href="pricing.html">Pricing</a><a href="privacy.html" aria-current="page">Privacy</a><a class="button" href="https://github.com/Lemelson/x-post-toolkit">Get the extension</a></div></nav></header>
+    <main>
+      <header class="page-hero"><p class="eyebrow">Privacy policy · Effective July 14, 2026</p><h1>Local by design, clear about the boundaries.</h1><p>This policy explains what X Video Toolkit handles, why it needs each browser capability, where information is stored, and what still leaves your device when you fetch source media.</p></header>
+      <div class="docs-layout">
+        <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#summary">Summary</a><a href="#data">Information handled</a><a href="#permissions">Permissions</a><a href="#storage">Storage and retention</a><a href="#sharing">Sharing</a><a href="#security">Security</a><a href="#rights">Your choices</a><a href="#changes">Changes</a><a href="#contact">Contact</a></aside>
+        <article class="prose">
+          <h2 id="summary">Summary</h2>
+          <p>X Video Toolkit is a browser extension and local macOS helper. The project operator does <strong>not</strong> run an analytics service, advertising service, hosted backend, or transcription server. The extension does not sell personal information.</p>
+          <p>When you request a download or transcript, the software must contact the original media host to fetch the media. Transcription is then sent to Spokenly through a loopback address on your own Mac and processed with the locally selected model.</p>
+
+          <h2 id="data">Information the extension handles</h2>
+          <p>Depending on the action you choose, the extension may handle:</p>
+          <ul><li>the source page URL and a post or file identifier;</li><li>publicly visible post text, title, author name, and handle;</li><li>the media URL and downloaded video or audio bytes;</li><li>generated transcript text and timestamps;</li><li>a short transcript preview;</li><li>your history and formatting settings;</li><li>local diagnostic information written by the Native Messaging host.</li></ul>
+          <p>The software does not ask for your account password, payment details, contacts, or precise location.</p>
+
+          <h2 id="permissions">Why the browser permissions are required</h2>
+          <h3>Host access</h3><p>Access to <code>x.com</code>, <code>twitter.com</code>, Google Drive, and declared media delivery hosts is used to identify the active video and resolve media that your browser can already access.</p>
+          <h3>Downloads</h3><p>Used only when you ask to save a video, TXT transcript, or SRT subtitle file.</p>
+          <h3>Tabs</h3><p>Used to determine the supported video in the active tab and associate actions with the correct source page.</p>
+          <h3>Native Messaging</h3><p>Connects the extension to the installed local helper, which invokes FFmpeg and calls Spokenly on <code>127.0.0.1</code>.</p>
+          <h3>Storage</h3><p>Stores verified transcript history, source metadata, cache records, and your chosen settings in <code>chrome.storage.local</code>.</p>
+          <h3>Clipboard write</h3><p>Copies a transcript only after you use a transcript or copy action.</p>
+
+          <h2 id="storage">Storage and retention</h2>
+          <p>Temporary audio is created in a per-request temporary directory and deleted when the request completes or fails. Verified transcripts and source metadata remain in browser-local storage according to the retention and history limits you choose.</p>
+          <p>Local host diagnostics may be written to <code>~/Library/Logs/xvdl-native-host.log</code>. You control this file through your operating system and may delete it.</p>
+
+          <h2 id="sharing">Network access and sharing</h2>
+          <p>The extension contacts X/Twitter, Google Drive, or their declared media delivery hosts to retrieve the media you requested. Those services process requests under their own privacy policies and may receive normal network information such as your IP address and request headers.</p>
+          <p>The local helper sends a file path to Spokenly's loopback-only server. When NVIDIA Parakeet v3 is selected, accepted transcription is expected to run locally. Spokenly is separate software; review its current settings and policy. Enabling Spokenly's Local-only mode blocks its online features.</p>
+          <p>This project does not transmit transcript history to a project-operated server and does not share or sell it to advertisers or data brokers.</p>
+
+          <h2 id="security">Security</h2>
+          <p>The Native Messaging host accepts only declared HTTPS media hosts, rejects URLs containing credentials and private or local media hosts, isolates temporary files per request, and verifies transcript coverage before saving a result. No software can guarantee absolute security. Test with non-sensitive media and keep your browser, operating system, and dependencies updated.</p>
+
+          <h2 id="rights">Your choices</h2>
+          <ul><li>Do not use Download or Transcript on media you do not want processed.</li><li>Clear transcript history from the extension popup.</li><li>Reduce the retention window or history item limit.</li><li>Delete downloaded files and the local diagnostic log through macOS.</li><li>Enable Local-only mode in Spokenly.</li><li>Uninstall the extension and run <code>./scripts/uninstall_native_host.sh</code>.</li></ul>
+
+          <h2 id="children">Children's privacy</h2><p>X Video Toolkit is a general-purpose developer utility and is not directed to children. The project operator does not knowingly collect children's personal information through a hosted service.</p>
+
+          <h2 id="changes">Changes to this policy</h2><p>Material changes will be published on this page and reflected by an updated effective date. Repository history may also show how the policy changed.</p>
+
+          <h2 id="contact">Contact and security reports</h2><p>For general questions, open an issue in the <a href="https://github.com/Lemelson/x-post-toolkit/issues">public repository</a> without including private URLs, transcripts, tokens, or personal data. Report security vulnerabilities through <a href="https://github.com/Lemelson/x-post-toolkit/security/advisories/new">GitHub private vulnerability reporting</a>.</p>
+          <p>This project is not affiliated with X Corp., Google, NVIDIA, Apple, FluidInference, or Spokenly.</p>
+        </article>
+      </div>
+    </main>
+    <footer class="site-footer"><span>© <span data-year></span> X Video Toolkit. MIT licensed.</span><div class="footer-links"><a href="index.html">Overview</a><a href="setup.html">Setup</a><a href="pricing.html">Pricing</a><a href="https://github.com/Lemelson/x-post-toolkit">GitHub</a></div></footer>
+    <script src="site.js"></script>
+  </body>
+</html>

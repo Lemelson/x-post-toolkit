@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Download X videos and turn speech into private, local transcripts with one click. A free Chrome extension powered by NVIDIA Parakeet v3 through Spokenly." />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="X Video Toolkit — Watch it. Save it. Read it." />
+    <meta property="og:description" content="Download X videos and turn speech into private, local transcripts with one click." />
+    <meta property="og:url" content="https://lemelson.github.io/x-post-toolkit/" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="theme-color" content="#f7f7f4" />
+    <link rel="canonical" href="https://lemelson.github.io/x-post-toolkit/" />
+    <link rel="stylesheet" href="styles.css" />
+    <title>X Video Toolkit — Download and transcribe X videos locally</title>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "X Video Toolkit",
+        "applicationCategory": "BrowserApplication",
+        "operatingSystem": "macOS",
+        "description": "A Chrome extension for downloading supported X and Google Drive videos and transcribing speech locally with NVIDIA Parakeet v3 through Spokenly.",
+        "softwareVersion": "0.4.0",
+        "license": "https://opensource.org/license/mit",
+        "isAccessibleForFree": true,
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "codeRepository": "https://github.com/Lemelson/x-post-toolkit"
+      }
+    </script>
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="nav" aria-label="Main navigation">
+        <a class="brand" href="index.html" aria-label="X Video Toolkit home">
+          <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 8v8M9 5v14M13 8v8M17 3v18M21 8v8" /></svg></span>
+          <span>X Video Toolkit</span>
+        </a>
+        <button class="menu-button" type="button" aria-label="Toggle navigation" aria-expanded="false" data-menu-button>
+          <svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 8h16M4 16h16" /></svg>
+        </button>
+        <div class="nav-links" data-menu>
+          <a href="index.html" aria-current="page">Overview</a>
+          <a href="setup.html">Setup</a>
+          <a href="pricing.html">Pricing</a>
+          <a href="privacy.html">Privacy</a>
+          <a class="button" href="https://github.com/Lemelson/x-post-toolkit">Get the extension</a>
+        </div>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Local video workflow for X and Google Drive</p>
+          <h1>Watch it. Save it. <span>Read it.</span></h1>
+          <p class="hero-copy">A free Chrome extension that adds Download and Transcript actions directly to video posts. Keep the MP4, copy the words, or export clean TXT and SRT files — without sending audio to our servers.</p>
+          <div class="hero-actions">
+            <a class="button" href="setup.html">Install from GitHub <span aria-hidden="true">→</span></a>
+            <a class="button secondary" href="#how-it-works">See how it works</a>
+          </div>
+          <p class="compatibility">Chrome-compatible browser · macOS · Apple Silicon · Spokenly</p>
+        </div>
+
+        <div class="product-demo" aria-label="Illustration of X Video Toolkit on a video post">
+          <div class="demo-topbar"><span>x.com/post</span><span class="demo-status"><span class="status-dot"></span>Local model ready</span></div>
+          <div class="post">
+            <div class="post-meta"><span class="avatar">AK</span><span><strong>Alex Kline</strong><br /><span class="post-handle">@alexbuilds</span></span></div>
+            <p class="post-text">A short explanation is useful. A searchable transcript is better.</p>
+            <div class="video-frame">
+              <div class="video-lines"><span></span><span></span><span></span></div>
+              <span class="play" aria-hidden="true"><svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="m9 6 9 6-9 6V6Z" /></svg></span>
+            </div>
+            <div class="inline-actions"><span class="inline-action">Download MP4</span><span class="inline-action active">Transcript copied</span></div>
+          </div>
+          <div class="demo-caption"><strong>15.2 seconds of speech</strong><span>Transcribed locally with timestamps</span></div>
+        </div>
+      </section>
+
+      <section class="section" id="features">
+        <div class="section-heading">
+          <h2>One button, useful output.</h2>
+          <p>Built for researchers, writers, editors, developers, and anyone who would rather search, quote, summarize, or archive a video than replay it five times.</p>
+        </div>
+        <div class="feature-list">
+          <article class="feature-row"><span class="feature-number">01</span><h3>Download the video</h3><p>Save the best available MP4 from a supported X post or Google Drive preview. The extension works with primary, quoted, retweeted, and nested X videos.</p></article>
+          <article class="feature-row"><span class="feature-number">02</span><h3>Transcribe on your Mac</h3><p>FFmpeg prepares temporary audio, then Spokenly runs NVIDIA Parakeet TDT 0.6B v3 locally through its Apple-optimized Core ML pipeline.</p></article>
+          <article class="feature-row"><span class="feature-number">03</span><h3>Copy or export</h3><p>Copy clean text, add timestamps every 10, 30, or 60 seconds, download TXT, or create sentence-level SRT subtitles.</p></article>
+          <article class="feature-row"><span class="feature-number">04</span><h3>Reuse verified work</h3><p>Completed transcripts stay in browser-local history for your chosen retention window. Reopening the same video can reuse the saved result instead of rerunning the model.</p></article>
+        </div>
+      </section>
+
+      <section class="section" id="how-it-works">
+        <div class="section-heading">
+          <h2>Set it up once.</h2>
+          <p>The extension is currently installed from GitHub. A small Native Messaging host connects the browser to local FFmpeg and Spokenly — no hosted transcription account required.</p>
+        </div>
+        <div class="workflow">
+          <div class="steps">
+            <article class="step"><h3>Install the local tools</h3><p>Install FFmpeg and Python, then install the current sideload macOS build of Spokenly.</p></article>
+            <article class="step"><h3>Download Parakeet inside Spokenly</h3><p>Select NVIDIA Parakeet TDT 0.6B v3 for file transcription and enable Spokenly's local MCP server.</p></article>
+            <article class="step"><h3>Load the Chrome extension</h3><p>Clone this repository, turn on Developer mode, and choose Load unpacked.</p></article>
+            <article class="step"><h3>Connect the native host</h3><p>Run the included installer once, reload the extension, and open a supported video.</p></article>
+            <a class="button secondary" href="setup.html">Read the complete setup guide</a>
+          </div>
+          <div class="terminal" aria-label="Installation command example">
+            <div class="terminal-bar"><span>TERMINAL</span><span>macOS</span></div>
+            <pre><span class="command">$</span> brew install ffmpeg python
+
+<span class="command">$</span> git clone \
+  https://github.com/Lemelson/x-post-toolkit.git
+
+<span class="command">$</span> cd x-post-toolkit
+<span class="command">$</span> ./scripts/install_native_host.sh
+
+Native host installed.</pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="privacy-band">
+          <blockquote>Audio stays local. Your transcript stays yours.</blockquote>
+          <aside><p>This project runs no analytics SDK, hosted backend, or transcription server. Media must still be fetched from its source, but temporary audio is deleted and accepted transcripts are stored in your browser.</p><a class="button secondary" href="privacy.html">Read the privacy policy</a></aside>
+        </div>
+      </section>
+
+      <section class="cta">
+        <div><p class="eyebrow">Free and open source</p><h2>Turn the next video into text.</h2><p>Install the developer release from GitHub and use the model already managed by Spokenly.</p></div>
+        <a class="button" href="https://github.com/Lemelson/x-post-toolkit">View on GitHub <span aria-hidden="true">→</span></a>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>© <span data-year></span> X Video Toolkit. MIT licensed.</span>
+      <div class="footer-links"><a href="setup.html">Setup</a><a href="pricing.html">Pricing</a><a href="privacy.html">Privacy</a><a href="https://github.com/Lemelson/x-post-toolkit">GitHub</a></div>
+    </footer>
+    <script src="site.js"></script>
+  </body>
+</html>
