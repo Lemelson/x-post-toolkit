@@ -1,37 +1,47 @@
 {
   "manifest_version": 3,
-  "name": "X Post Toolkit",
-  "version": "0.2.0",
-  "description": "Download X videos and generate local transcripts with one click.",
+  "name": "X Video Toolkit — Download & Transcribe",
+  "short_name": "X Video Toolkit",
+  "version": "0.4.0",
+  "description": "One-click X/Twitter and Google Drive video downloads with private local NVIDIA Parakeet v3 transcription.",
   "permissions": [
     "downloads",
     "tabs",
     "nativeMessaging",
-    "storage"
+    "storage",
+    "clipboardWrite"
   ],
   "host_permissions": [
     "https://x.com/*",
     "https://twitter.com/*",
     "https://cdn.syndication.twimg.com/*",
-    "https://video.twimg.com/*"
+    "https://video.twimg.com/*",
+    "https://drive.google.com/*",
+    "https://drive.usercontent.google.com/*",
+    "https://*.googlevideo.com/*",
+    "https://*.googleusercontent.com/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "content_scripts": [
     {
       "matches": [
         "https://x.com/*",
-        "https://twitter.com/*"
+        "https://twitter.com/*",
+        "https://drive.google.com/*"
       ],
       "js": [
+        "content_x_adapter.js",
+        "content_drive_adapter.js",
         "content.js"
       ],
       "run_at": "document_idle"
     }
   ],
   "action": {
-    "default_title": "X Video Downloader",
+    "default_title": "Video Toolkit",
     "default_popup": "popup.html"
   }
 }

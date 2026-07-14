@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Install and configure X Video Toolkit, Spokenly, and NVIDIA Parakeet v3 on an Apple Silicon Mac." />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="Setup guide — X Video Toolkit" />
+    <meta property="og:description" content="Install the extension, connect Spokenly, and create your first local transcript." />
+    <meta property="og:url" content="https://lemelson.github.io/x-post-toolkit/setup.html" />
+    <meta name="theme-color" content="#f7f7f4" />
+    <link rel="canonical" href="https://lemelson.github.io/x-post-toolkit/setup.html" />
+    <link rel="stylesheet" href="styles.css" />
+    <title>Setup guide — X Video Toolkit</title>
+  </head>
+  <body>
+    <header class="site-header"><nav class="nav" aria-label="Main navigation"><a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 8v8M9 5v14M13 8v8M17 3v18M21 8v8" /></svg></span><span>X Video Toolkit</span></a><button class="menu-button" type="button" aria-label="Toggle navigation" aria-expanded="false" data-menu-button><svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 8h16M4 16h16" /></svg></button><div class="nav-links" data-menu><a href="index.html">Overview</a><a href="setup.html" aria-current="page">Setup</a><a href="pricing.html">Pricing</a><a href="privacy.html">Privacy</a><a class="button" href="https://github.com/Lemelson/x-post-toolkit">Get the extension</a></div></nav></header>
+    <main>
+      <header class="page-hero"><p class="eyebrow">Installation and configuration</p><h1>From GitHub to your first transcript.</h1><p>This developer release uses a Chrome extension, a local Native Messaging host, FFmpeg, and Spokenly. Allow about ten minutes for the first setup and model download.</p></header>
+      <div class="docs-layout">
+        <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#requirements">Requirements</a><a href="#spokenly">Configure Spokenly</a><a href="#extension">Install the extension</a><a href="#native-host">Connect the native host</a><a href="#usage">Use it</a><a href="#troubleshooting">Troubleshooting</a></aside>
+        <article class="prose">
+          <h2 id="requirements">1. Check the requirements</h2>
+          <p>You need an <strong>Apple Silicon Mac</strong>, a Chromium-based browser, the current sideload macOS version of <a href="https://spokenly.app/releases/macos">Spokenly</a>, and enough free storage for Spokenly's Parakeet model and temporary audio.</p>
+          <h3>Install FFmpeg and Python</h3>
+          <p>If you use Homebrew, open Terminal and run:</p>
+          <pre><code>brew install ffmpeg python</code></pre>
+          <p>The Native Messaging host uses Python. FFmpeg downloads or reads the source media and creates a temporary 16 kHz mono WAV for transcription.</p>
+
+          <h2 id="spokenly">2. Configure Spokenly</h2>
+          <ol><li>Install and open the current sideload macOS build of Spokenly.</li><li>Open <strong>Dictation Models</strong> or <strong>Transcribe File</strong>.</li><li>Download <strong>NVIDIA Parakeet TDT 0.6B v3</strong>.</li><li>Select it as the model for file transcription.</li><li>Enable <strong>Voice for AI Agents (MCP)</strong> so the local server is available.</li><li>Optional: enable <strong>Local-only mode</strong> to disable Spokenly's online features.</li></ol>
+          <div class="note"><strong>Download the model inside Spokenly.</strong> You do not need a second Hugging Face or MLX copy for this extension. Spokenly manages the Apple-optimized FluidAudio/Core ML conversion.</div>
+
+          <h2 id="extension">3. Install the extension</h2>
+          <p>Clone or download the public repository:</p>
+          <pre><code>git clone https://github.com/Lemelson/x-post-toolkit.git
+cd x-post-toolkit</code></pre>
+          <ol><li>Open <code>chrome://extensions</code> or your browser's equivalent extensions page.</li><li>Enable <strong>Developer mode</strong>.</li><li>Choose <strong>Load unpacked</strong>.</li><li>Select the cloned <code>x-post-toolkit</code> folder.</li></ol>
+          <p>The extension currently supports Chrome, Helium, Comet, Arc, Brave, Edge, Vivaldi, Chromium, and Opera on macOS.</p>
+
+          <h2 id="native-host">4. Connect the Native Messaging host</h2>
+          <p>From the repository folder, run:</p>
+          <pre><code>./scripts/install_native_host.sh</code></pre>
+          <p>The installer normally detects the unpacked extension ID and creates the browser-specific manifest. If detection fails, copy the extension ID from the extensions page and run:</p>
+          <pre><code>./scripts/install_native_host.sh &lt;extension_id&gt;</code></pre>
+          <p>Reload the extension, refresh the X or Google Drive page, and keep Spokenly open in the background.</p>
+
+          <h2 id="usage">5. Use it</h2>
+          <ol><li>Open a supported X video post or Google Drive video preview.</li><li>Select the injected <strong>Download</strong> or <strong>Transcript</strong> action.</li><li>Follow the bottom-right progress message.</li><li>After verification, the transcript is copied and added to browser-local history.</li></ol>
+          <p>Open the extension popup to copy clean or timestamped text, export TXT or SRT, adjust timestamp frequency, include the post title, or change history retention.</p>
+
+          <h2 id="troubleshooting">Troubleshooting</h2>
+          <h3>“Native host is unavailable”</h3><p>Run the installer again with the extension ID, reload the extension, and refresh the page.</p>
+          <h3>“Spokenly is unavailable”</h3><p>Start Spokenly, enable Voice for AI Agents (MCP), and confirm Parakeet v3 is selected for file transcription.</p>
+          <h3>No MP4 is found</h3><p>The post may be private, deleted, protected, region-restricted, expired, or use a media format that is not currently supported. The extension does not bypass access controls.</p>
+          <h3>The result is incomplete</h3><p>The extension rejects incomplete audio and transcripts instead of saving them. Try again and inspect <code>~/Library/Logs/xvdl-native-host.log</code> if the problem continues.</p>
+        </article>
+      </div>
+    </main>
+    <footer class="site-footer"><span>© <span data-year></span> X Video Toolkit. MIT licensed.</span><div class="footer-links"><a href="index.html">Overview</a><a href="pricing.html">Pricing</a><a href="privacy.html">Privacy</a><a href="https://github.com/Lemelson/x-post-toolkit">GitHub</a></div></footer>
+    <script src="site.js"></script>
+  </body>
+</html>

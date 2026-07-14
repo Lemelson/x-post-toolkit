@@ -4,3 +4,17 @@ __pycache__/
 *.log
 node_modules/
 dist/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.sqlite*
+*.db
+*.wav
+*.aiff
+*.m4a
+*.mp3
+*.mp4
+coverage/

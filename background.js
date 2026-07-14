@@ -1,20 +1,25 @@
 "use strict";
 
-const TWEET_ID_RE = /\b(\d{8,30})\b/;
-const NATIVE_HOST_NAME = "com.xvdl.transcriber";
-const CACHE_TTL_MS = 30 * 60 * 1000;
-const STORE_KEY_BY_ID = "transcriptsByTweetId";
-const STORE_KEY_HISTORY = "transcriptHistory";
-const STORE_KEY_SETTINGS = "transcriptSettings";
-const DEFAULT_SETTINGS = {
-  maxItems: 10,
-  retentionHours: 72
-};
+import { getItemContext, normalizeItemId } from "./src/background/context.js";
+import { startTranscriptDownload, startVideoDownload } from "./src/background/downloads.js";
+import { buildSrt, buildTranscriptOutput } from "./src/background/format.js";
+import { resolveBestMedia, resolveMediaCandidates } from "./src/background/media.js";
+import { debugNativeHost, runNativeTranscription } from "./src/background/native.js";
+import {
+  clearTranscriptHistory,
+  getPrunedStore,
+  isTranscriptCacheUsable,
+  isTranscriptVerified,
+  saveTranscriptEntry,
+  updateTranscriptSettings
+} from "./src/background/store.js";
+
+const HOUR_MS = 60 * 60 * 1000;
 
 let transcriptQueue = Promise.resolve();
 const inFlightTranscripts = new Map();
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message?.type) {
     return;
   }
@@ -23,10 +28,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     try {
       switch (message.type) {
         case "DOWNLOAD_TWEET_VIDEO":
+        case "DOWNLOAD_VIDEO_ITEM":
+        case "DOWNLOAD_PAGE_VIDEO":
           sendResponse(await handleDownloadMessage(message));
           return;
         case "TRANSCRIBE_TWEET_VIDEO":
-          sendResponse(await handleTranscriptMessage(message));
+        case "TRANSCRIBE_VIDEO_ITEM":
+        case "TRANSCRIBE_PAGE_VIDEO":
+          sendResponse(await handleTranscriptMessage(message, sender));
           return;
         case "DEBUG_NATIVE_HOST":
           sendResponse(await debugNativeHost());
@@ -35,10 +44,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           sendResponse(await getPopupState(message));
           return;
         case "GET_TRANSCRIPT_FOR_TWEET":
-          sendResponse(await getTranscriptForTweet(message));
+        case "GET_TRANSCRIPT_FOR_ITEM":
+          sendResponse(await getTranscriptForItem(message));
           return;
         case "DOWNLOAD_TWEET_TRANSCRIPT":
-          sendResponse(await downloadTranscriptForTweet(message));
+        case "DOWNLOAD_ITEM_TRANSCRIPT":
+          sendResponse(await downloadTranscriptForItem(message));
           return;
         case "CLEAR_TRANSCRIPT_HISTORY":
           sendResponse(await clearTranscriptHistory());
@@ -52,6 +63,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     } catch (error) {
       sendResponse({
         ok: false,
+        code: error?.code ? String(error.code) : undefined,
         error: error instanceof Error ? error.message : String(error)
       });
     }
@@ -61,17 +73,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 async function handleDownloadMessage(message) {
-  const tweetId = extractTweetId(message.tweetId || message.tweetUrl || "");
-  if (!tweetId) {
-    throw new Error("Could not detect tweet ID.");
-  }
-
-  const media = await resolveBestMp4(tweetId);
-  const downloadId = await startVideoDownload(tweetId, media);
+  const context = getItemContext(message);
+  const media = await resolveBestMedia(context, "download");
+  const downloadId = await startVideoDownload(context, media);
 
   return {
     ok: true,
-    tweetId,
+    itemId: context.itemId,
+    platform: context.platform,
     source: media.source,
     bitrate: media.bitrate || null,
     url: media.url,
@@ -79,311 +88,356 @@ async function handleDownloadMessage(message) {
   };
 }
 
-async function handleTranscriptMessage(message) {
-  const tweetId = extractTweetId(message.tweetId || message.tweetUrl || "");
-  if (!tweetId) {
-    throw new Error("Could not detect tweet ID.");
-  }
-
-  const meta = extractTweetMeta(message, tweetId);
+async function handleTranscriptMessage(message, sender) {
+  const context = getItemContext(message);
+  const tabId = sender?.tab?.id;
+  const onProgress = Number.isInteger(tabId)
+    ? (stage) => sendProgressToTab(tabId, context.itemId, stage)
+    : null;
   const now = Date.now();
   const store = await getPrunedStore();
-  const cached = store.byId?.[tweetId] || null;
+  const cached = store.byId?.[context.itemId] || null;
+  const cacheTtlMs = getCacheTtlMs(store.settings);
 
-  if (cached && now - Number(cached.updatedAt || 0) < CACHE_TTL_MS) {
-    const leftMs = CACHE_TTL_MS - (now - Number(cached.updatedAt || 0));
-    if (shouldPatchMeta(cached, meta)) {
-      await saveTranscriptEntry({ ...cached, ...meta, tweetId }, store.settings);
+  if (isTranscriptCacheUsable(cached, now, cacheTtlMs)) {
+    const leftMs = cacheTtlMs - (now - Number(cached.updatedAt || 0));
+    const merged = mergeEntryMeta(cached, context);
+    if (shouldPatchMeta(cached, context)) {
+      await saveTranscriptEntry(merged, store.settings);
     }
 
     return {
       ok: true,
       cached: true,
-      tweetId,
+      itemId: context.itemId,
+      platform: context.platform,
+      text: buildTranscriptOutput(merged, store.settings),
       chars: Number(cached.chars || 0),
       preview: String(cached.preview || ""),
       cacheTtlSec: Math.max(0, Math.floor(leftMs / 1000))
     };
   }
+  if (cached?.text && now - Number(cached.updatedAt || 0) < cacheTtlMs) {
+    onProgress?.({ stage: "invalid-cache" });
+  }
 
-  await setGlobalBadge("TXT", "#1d9bf0");
+  await badgeJobStarted();
 
   try {
-    const result = await enqueueTranscript(tweetId, meta, store.settings);
-    await setGlobalBadge("OK", "#00ba7c");
-    clearGlobalBadgeLater(3200);
+    const result = await enqueueTranscript(context, store.settings, onProgress);
+    await badgeJobFinished(true);
     return result;
   } catch (error) {
-    await setGlobalBadge("ERR", "#f4212e");
-    clearGlobalBadgeLater(4200);
+    await badgeJobFinished(false);
     throw error;
   }
 }
 
-function enqueueTranscript(tweetId, meta, settings) {
-  const existing = inFlightTranscripts.get(tweetId);
+function enqueueTranscript(context, settings, onProgress) {
+  const existing = inFlightTranscripts.get(context.itemId);
   if (existing) {
     return existing;
   }
 
-  const job = transcriptQueue.then(() => runTranscriptJob(tweetId, meta, settings));
+  const job = transcriptQueue.then(() => runTranscriptJob(context, settings, onProgress));
   transcriptQueue = job.catch(() => undefined);
 
   const tracked = job.finally(() => {
-    inFlightTranscripts.delete(tweetId);
+    inFlightTranscripts.delete(context.itemId);
   });
-  inFlightTranscripts.set(tweetId, tracked);
+  inFlightTranscripts.set(context.itemId, tracked);
   return tracked;
 }
 
-async function runTranscriptJob(tweetId, meta, settings) {
+async function runTranscriptJob(context, settings, onProgress) {
   const now = Date.now();
   const store = await getPrunedStore(settings);
-  const cached = store.byId?.[tweetId] || null;
-  if (cached && now - Number(cached.updatedAt || 0) < CACHE_TTL_MS) {
+  const cached = store.byId?.[context.itemId] || null;
+  const cacheTtlMs = getCacheTtlMs(store.settings);
+  if (isTranscriptCacheUsable(cached, now, cacheTtlMs)) {
+    const merged = mergeEntryMeta(cached, context);
     return {
       ok: true,
       cached: true,
-      tweetId,
+      itemId: context.itemId,
+      platform: context.platform,
+      text: buildTranscriptOutput(merged, store.settings),
       chars: Number(cached.chars || 0),
       preview: String(cached.preview || ""),
-      cacheTtlSec: Math.max(0, Math.floor((CACHE_TTL_MS - (now - Number(cached.updatedAt || 0))) / 1000))
+      cacheTtlSec: Math.max(0, Math.floor((cacheTtlMs - (now - Number(cached.updatedAt || 0))) / 1000))
     };
   }
 
-  const candidates = await resolveMp4Candidates(tweetId);
-  const transcriptResult = await transcribeWithFallback(tweetId, candidates);
+  const candidates = await resolveMediaCandidates(context, "transcript");
+  const transcriptResult = await transcribeWithFallback(context, candidates, onProgress);
   const media = transcriptResult.media;
   const transcript = transcriptResult.transcript;
+  const entry = {
+    itemId: context.itemId,
+    platform: context.platform,
+    itemUrl: context.itemUrl,
+    title: context.title,
+    tweetText: context.tweetText,
+    authorName: context.authorName,
+    authorHandle: context.authorHandle,
+    text: transcript.text,
+    sentences: transcript.sentences,
+    preview: transcript.preview,
+    chars: transcript.charCount,
+    source: media.source,
+    bitrate: media.bitrate || null,
+    validationVersion: transcript.validationVersion,
+    expectedDurationMs: transcript.expectedDurationMs,
+    audioDurationMs: transcript.audioDurationMs,
+    transcriptEndMs: transcript.transcriptEndMs,
+    complete: transcript.complete,
+    updatedAt: Date.now()
+  };
 
-  await saveTranscriptEntry(
-    {
-      tweetId,
-      text: transcript.text,
-      preview: transcript.preview,
-      chars: transcript.charCount,
-      source: media.source,
-      bitrate: media.bitrate || null,
-      updatedAt: now,
-      tweetUrl: meta.tweetUrl,
-      title: meta.title
-    },
-    store.settings
-  );
+  if (!isTranscriptVerified(entry)) {
+    const error = new Error(
+      "Native host returned an incomplete or unverified transcript. Reinstall the native host and retry."
+    );
+    error.code = "UNVERIFIED_TRANSCRIPT";
+    throw error;
+  }
+
+  await saveTranscriptEntry(entry, store.settings);
 
   return {
     ok: true,
     cached: false,
-    tweetId,
+    itemId: context.itemId,
+    platform: context.platform,
     source: media.source,
     bitrate: media.bitrate || null,
+    text: buildTranscriptOutput(
+      {
+        title: context.title,
+        tweetText: context.tweetText,
+        authorName: context.authorName,
+        authorHandle: context.authorHandle,
+        platform: context.platform,
+        text: transcript.text,
+        sentences: transcript.sentences
+      },
+      store.settings
+    ),
     chars: transcript.charCount,
-    preview: transcript.preview
+    preview: transcript.preview,
+    complete: transcript.complete,
+    expectedDurationMs: transcript.expectedDurationMs,
+    audioDurationMs: transcript.audioDurationMs,
+    transcriptEndMs: transcript.transcriptEndMs
   };
 }
 
 async function getPopupState(message) {
-  const tweetId = extractTweetId(message?.tweetId || "");
+  const requestedId = normalizeItemId(
+    message?.itemId || message?.tweetId || "",
+    message?.platform,
+    message?.itemUrl || message?.tweetUrl || message?.pageUrl || ""
+  );
   const store = await getPrunedStore();
-  const current = tweetId ? store.byId?.[tweetId] : null;
+  const candidate = requestedId ? store.byId?.[requestedId] : null;
+  const current = isTranscriptVerified(candidate) ? candidate : null;
   const now = Date.now();
+  const cacheTtlMs = getCacheTtlMs(store.settings);
 
   return {
     ok: true,
-    tweetId: tweetId || null,
-    cacheTtlSec: Math.floor(CACHE_TTL_MS / 1000),
+    itemId: requestedId || null,
+    cacheTtlSec: Math.floor(cacheTtlMs / 1000),
     settings: store.settings,
     current: current
       ? {
-          tweetId: current.tweetId,
+          itemId: current.itemId,
+          itemUrl: String(current.itemUrl || ""),
           title: String(current.title || ""),
-          tweetUrl: String(current.tweetUrl || makeTweetUrl(current.tweetId)),
+          tweetText: String(current.tweetText || ""),
+          authorName: String(current.authorName || ""),
+          authorHandle: String(current.authorHandle || ""),
+          platform: String(current.platform || ""),
           chars: Number(current.chars || 0),
           preview: String(current.preview || ""),
+          hasTimestamps: Array.isArray(current.sentences) && current.sentences.length > 0,
           updatedAt: Number(current.updatedAt || 0),
-          cachedFresh: now - Number(current.updatedAt || 0) < CACHE_TTL_MS
+          cachedFresh: isTranscriptCacheUsable(current, now, cacheTtlMs)
         }
       : null,
-    history: store.history.map((item) => ({
-      tweetId: item.tweetId,
+    history: store.history.filter((item) => isTranscriptVerified(store.byId?.[item.itemId])).map((item) => ({
+      itemId: item.itemId,
+      itemUrl: String(item.itemUrl || ""),
       title: String(item.title || ""),
-      tweetUrl: String(item.tweetUrl || makeTweetUrl(item.tweetId)),
+      tweetText: String(item.tweetText || ""),
+      authorName: String(item.authorName || ""),
+      authorHandle: String(item.authorHandle || ""),
+      platform: String(item.platform || ""),
       chars: Number(item.chars || 0),
       preview: String(item.preview || ""),
+      hasTimestamps:
+        item.hasTimestamps === true ||
+        (Array.isArray(store.byId?.[item.itemId]?.sentences) && store.byId[item.itemId].sentences.length > 0),
       updatedAt: Number(item.updatedAt || 0)
     }))
   };
 }
 
-async function getTranscriptForTweet(message) {
-  const tweetId = extractTweetId(message?.tweetId || "");
-  if (!tweetId) {
-    return { ok: false, error: "Could not detect tweet ID." };
+function getCacheTtlMs(settings) {
+  return Math.max(1, Number(settings?.retentionHours || 0)) * HOUR_MS;
+}
+
+async function getTranscriptForItem(message) {
+  const context = getItemContext(message);
+  const store = await getPrunedStore();
+  const entry = store.byId?.[context.itemId] || null;
+  if (!isTranscriptVerified(entry)) {
+    return { ok: false, error: "A verified complete transcript is not available for this video." };
   }
 
-  const store = await getPrunedStore();
-  const entry = store.byId?.[tweetId] || null;
-  if (!entry?.text) {
-    return { ok: false, error: "Transcript not found for this tweet." };
+  const text = renderTranscriptText(entry, store.settings, message?.format);
+  if (text === null) {
+    return { ok: false, error: "No timestamps are stored for this transcript. Re-run it to capture them." };
   }
 
   return {
     ok: true,
-    tweetId,
+    itemId: context.itemId,
+    itemUrl: String(entry.itemUrl || ""),
     title: String(entry.title || ""),
-    tweetUrl: String(entry.tweetUrl || makeTweetUrl(tweetId)),
-    text: String(entry.text),
+    tweetText: String(entry.tweetText || ""),
+    authorName: String(entry.authorName || ""),
+    authorHandle: String(entry.authorHandle || ""),
+    platform: String(entry.platform || context.platform || ""),
+    text,
     chars: Number(entry.chars || 0),
     preview: String(entry.preview || ""),
     updatedAt: Number(entry.updatedAt || 0)
   };
 }
 
-async function downloadTranscriptForTweet(message) {
-  const tweetId = extractTweetId(message?.tweetId || "");
-  if (!tweetId) {
-    return { ok: false, error: "Could not detect tweet ID." };
-  }
-
+async function downloadTranscriptForItem(message) {
+  const context = getItemContext(message);
   const store = await getPrunedStore();
-  const entry = store.byId?.[tweetId] || null;
-  if (!entry?.text) {
-    return { ok: false, error: "No transcript available for this tweet yet." };
+  const entry = store.byId?.[context.itemId] || null;
+  if (!isTranscriptVerified(entry)) {
+    return { ok: false, error: "No verified complete transcript is available for this video yet." };
   }
 
-  const downloadId = await startTranscriptDownload(tweetId, String(entry.text));
-  return { ok: true, tweetId, downloadId };
-}
-
-async function clearTranscriptHistory() {
-  await chrome.storage.local.set({
-    [STORE_KEY_BY_ID]: {},
-    [STORE_KEY_HISTORY]: []
-  });
-  return { ok: true };
-}
-
-async function updateTranscriptSettings(message) {
-  const current = await getSettings();
-  const next = sanitizeSettings({
-    ...current,
-    ...message?.settings
-  });
-
-  await chrome.storage.local.set({ [STORE_KEY_SETTINGS]: next });
-  await getPrunedStore(next);
-
-  return { ok: true, settings: next };
-}
-
-function extractTweetId(input) {
-  const text = String(input || "");
-  const statusMatch = text.match(/status\/(\d{8,30})/);
-  if (statusMatch) {
-    return statusMatch[1];
-  }
-  const rawMatch = text.match(TWEET_ID_RE);
-  return rawMatch ? rawMatch[1] : null;
-}
-
-function makeTweetUrl(tweetId) {
-  return `https://x.com/i/web/status/${tweetId}`;
-}
-
-function extractTweetMeta(message, tweetId) {
-  const title = buildTitleSnippet(message?.tweetText || message?.title || "");
-  const urlFromInput = String(message?.tweetUrl || "");
-  const parsedId = extractTweetId(urlFromInput);
-  const normalizedId = parsedId || tweetId;
-
-  return {
-    title,
-    tweetUrl: makeTweetUrl(normalizedId)
-  };
-}
-
-function buildTitleSnippet(text) {
-  const normalized = String(text || "")
-    .replace(/\r/g, "\n")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .slice(0, 2)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!normalized) {
-    return "";
+  const format = String(message?.format || "default");
+  const text = renderTranscriptText(entry, store.settings, format);
+  if (text === null) {
+    return { ok: false, error: "No timestamps are stored for this transcript. Re-run it to capture them." };
   }
 
-  return normalized.slice(0, 180);
+  const extension = format === "srt" ? ".srt" : ".txt";
+  const downloadId = await startTranscriptDownload(context, text, entry.title, extension);
+  return { ok: true, itemId: context.itemId, downloadId };
+}
+
+// Returns null when the requested format needs timestamps that the entry
+// does not have (older cache entries recorded before sentence storage).
+function renderTranscriptText(entry, settings, format) {
+  const kind = String(format || "default");
+  if (kind === "srt" || kind === "timestamps") {
+    if (!Array.isArray(entry.sentences) || !entry.sentences.length) {
+      return null;
+    }
+    if (kind === "srt") {
+      return buildSrt(entry.sentences);
+    }
+  }
+  if (kind === "clean" || kind === "timestamps") {
+    return buildTranscriptOutput(entry, settings, kind);
+  }
+  return buildTranscriptOutput(entry, settings);
 }
 
 function shouldPatchMeta(entry, meta) {
-  return (!entry.title && !!meta.title) || (!entry.tweetUrl && !!meta.tweetUrl);
+  return (
+    (!entry.title && !!meta.title) ||
+    (!entry.tweetText && !!meta.tweetText) ||
+    (!entry.authorName && !!meta.authorName) ||
+    (!entry.authorHandle && !!meta.authorHandle) ||
+    (!entry.itemUrl && !!meta.itemUrl) ||
+    (!entry.platform && !!meta.platform)
+  );
 }
 
-async function startVideoDownload(tweetId, media) {
-  const filename = `x_${tweetId}_${media.bitrate || "best"}.mp4`;
-  return chrome.downloads.download({
-    url: media.url,
-    filename,
-    conflictAction: "uniquify",
-    saveAs: false
-  });
+function mergeEntryMeta(entry, meta) {
+  const merged = { ...entry, itemId: meta.itemId || entry.itemId };
+  for (const key of ["itemUrl", "title", "tweetText", "authorName", "authorHandle", "platform"]) {
+    if (meta?.[key]) {
+      merged[key] = meta[key];
+    }
+  }
+  return merged;
 }
 
-async function startTranscriptDownload(tweetId, text) {
-  const filename = `x_${tweetId}_transcript.txt`;
-  const url = `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`;
-  return chrome.downloads.download({
-    url,
-    filename,
-    conflictAction: "uniquify",
-    saveAs: false
-  });
+function sendProgressToTab(tabId, itemId, progress) {
+  const details = progress && typeof progress === "object"
+    ? progress
+    : { stage: String(progress || "") };
+  try {
+    chrome.tabs.sendMessage(
+      tabId,
+      {
+        ...details,
+        type: "XVDL_PROGRESS",
+        itemId,
+        stage: String(details.stage || "")
+      },
+      () => void chrome.runtime.lastError
+    );
+  } catch (_error) {
+    // The tab may have navigated or closed; progress toasts are best-effort.
+  }
 }
+
+// The badge is shared across all tabs; count active jobs so queued
+// transcripts do not clear or overwrite each other's status.
+let activeBadgeJobs = 0;
 
 async function setGlobalBadge(text, color) {
   await chrome.action.setBadgeBackgroundColor({ color });
   await chrome.action.setBadgeText({ text });
 }
 
-function clearGlobalBadgeLater(ms) {
-  setTimeout(() => {
-    chrome.action.setBadgeText({ text: "" });
-  }, ms);
+async function badgeJobStarted() {
+  activeBadgeJobs += 1;
+  await setGlobalBadge("TXT", "#1d9bf0");
 }
 
-async function runNativeTranscription(tweetId, mp4Url) {
-  const response = await sendNativeMessage({
-    type: "transcribe",
-    tweetId,
-    mp4Url,
-    copyToClipboard: true
-  });
-
-  if (!response?.ok) {
-    throw new Error(response?.error || "Native transcriber failed.");
+async function badgeJobFinished(_ok) {
+  activeBadgeJobs = Math.max(0, activeBadgeJobs - 1);
+  if (activeBadgeJobs > 0) {
+    return;
   }
-
-  return {
-    text: String(response.transcript || ""),
-    charCount: Number(response.charCount || 0),
-    preview: String(response.preview || "")
-  };
+  // Service-worker timers are not durable. Clear immediately once the last
+  // job finishes so an OK/ERR badge cannot remain stuck after worker shutdown.
+  await chrome.action.setBadgeText({ text: "" });
 }
 
-async function transcribeWithFallback(tweetId, candidates) {
+async function transcribeWithFallback(context, candidates, onProgress) {
   let lastError = null;
 
   for (const media of candidates) {
     try {
-      const transcript = await runNativeTranscription(tweetId, media.url);
+      const transcript = await runNativeTranscription(context.itemId, media.url, {
+        onProgress,
+        expectedDurationMs: media.durationMs
+      });
       return { media, transcript };
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
+      if (
+        lastError.code === "FFMPEG_TIMEOUT" ||
+        lastError.code === "DOWNLOAD_FAILED" ||
+        lastError.code === "INCOMPLETE_AUDIO" ||
+        (media.source.endsWith(":audio") && lastError.code === "COMMAND_FAILED")
+      ) {
+        continue;
+      }
       if (!isRecoverableAudioError(lastError)) {
         throw lastError;
       }
@@ -391,9 +445,11 @@ async function transcribeWithFallback(tweetId, candidates) {
   }
 
   if (lastError) {
-    throw new Error(`No usable audio stream found across MP4 variants. Last error: ${lastError.message}`);
+    const error = new Error(`No usable audio stream found across video variants. Last error: ${lastError.message}`);
+    error.code = lastError.code || "NO_USABLE_AUDIO";
+    throw error;
   }
-  throw new Error("No MP4 candidates available for transcript.");
+  throw new Error("No video candidates available for transcript.");
 }
 
 function isRecoverableAudioError(error) {
@@ -406,378 +462,7 @@ function isRecoverableAudioError(error) {
     text.includes("does not contain any stream") ||
     text.includes("stream specifier") ||
     text.includes("error opening output file") ||
-    text.includes("invalid argument")
+    text.includes("invalid argument") ||
+    text.includes("ffmpeg timed out")
   );
-}
-
-async function debugNativeHost() {
-  try {
-    const ping = await sendNativeMessage({ type: "ping" });
-    return {
-      ok: true,
-      extensionId: chrome.runtime.id,
-      nativeHost: NATIVE_HOST_NAME,
-      ping
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      extensionId: chrome.runtime.id,
-      nativeHost: NATIVE_HOST_NAME,
-      error: error instanceof Error ? error.message : String(error)
-    };
-  }
-}
-
-function sendNativeMessage(payload) {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, payload, (response) => {
-      if (chrome.runtime.lastError) {
-        reject(
-          new Error(
-            [
-              "Native host is unavailable.",
-              `Extension ID: ${chrome.runtime.id}.`,
-              "Run setup from the project folder:",
-              `./scripts/install_native_host.sh ${chrome.runtime.id}`,
-              chrome.runtime.lastError.message
-            ].join(" ")
-          )
-        );
-        return;
-      }
-
-      resolve(response);
-    });
-  });
-}
-
-async function resolveBestMp4(tweetId) {
-  const candidates = await resolveMp4Candidates(tweetId);
-  return candidates[0];
-}
-
-async function resolveMp4Candidates(tweetId) {
-  const errors = [];
-
-  try {
-    return await getFromSyndication(tweetId);
-  } catch (error) {
-    errors.push(`syndication: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  throw new Error(`No downloadable MP4 found (${errors.join("; ")}).`);
-}
-
-async function getFromSyndication(tweetId) {
-  const url = new URL("https://cdn.syndication.twimg.com/tweet-result");
-  url.searchParams.set("id", tweetId);
-  url.searchParams.set("token", "x");
-
-  const res = await fetch(url.toString(), {
-    method: "GET",
-    credentials: "omit"
-  });
-
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
-
-  const payload = await res.json();
-  const variants = collectMp4Variants(payload);
-  if (!variants.length) {
-    throw new Error("no MP4 variants in response");
-  }
-
-  variants.sort(compareVariantPriority);
-  return variants.map((variant) => ({
-    source: variant.source || "cdn.syndication",
-    url: variant.url,
-    bitrate: variant.bitrate || 0
-  }));
-}
-
-function collectMp4Variants(payload) {
-  const seen = new Set();
-  const result = [];
-
-  const push = (url, bitrate, source) => {
-    if (typeof url !== "string" || !url.includes(".mp4")) {
-      return;
-    }
-    if (seen.has(url)) {
-      return;
-    }
-    seen.add(url);
-    result.push({
-      url,
-      bitrate: Number.isFinite(Number(bitrate)) ? Number(bitrate) : 0,
-      source: source || "cdn.syndication",
-      rank: sourceRank(source || "cdn.syndication")
-    });
-  };
-
-  const collectFromVariants = (variants, source) => {
-    if (!Array.isArray(variants)) {
-      return;
-    }
-    for (const variant of variants) {
-      if (!variant || variant.content_type !== "video/mp4") {
-        continue;
-      }
-      push(variant.url, variant.bitrate, source);
-    }
-  };
-
-  const collectFromMediaDetails = (mediaDetails, source) => {
-    if (!Array.isArray(mediaDetails)) {
-      return;
-    }
-    for (const media of mediaDetails) {
-      collectFromVariants(media?.video_info?.variants, source);
-    }
-  };
-
-  const collectFromTweetNode = (node, source) => {
-    if (!node || typeof node !== "object") {
-      return;
-    }
-    collectFromMediaDetails(node.mediaDetails, source);
-    collectFromVariants(node?.video?.variants, source);
-  };
-
-  collectFromTweetNode(payload, "cdn.syndication");
-  collectFromTweetNode(payload?.quoted_tweet, "cdn.syndication:quoted");
-  collectFromTweetNode(payload?.retweeted_tweet, "cdn.syndication:retweeted");
-
-  if (!result.length) {
-    walkForVideoInfo(payload, collectFromVariants, collectFromMediaDetails);
-  }
-
-  return result;
-
-  function walkForVideoInfo(node, addVariants, addMediaDetails, depth = 0) {
-    if (!node || depth > 6) {
-      return;
-    }
-
-    if (Array.isArray(node)) {
-      for (let i = 0; i < Math.min(node.length, 30); i += 1) {
-        walkForVideoInfo(node[i], addVariants, addMediaDetails, depth + 1);
-      }
-      return;
-    }
-
-    if (typeof node !== "object") {
-      return;
-    }
-
-    addMediaDetails(node.mediaDetails, "cdn.syndication:nested");
-    addVariants(node?.video_info?.variants, "cdn.syndication:nested");
-    addVariants(node?.video?.variants, "cdn.syndication:nested");
-
-    for (const [key, value] of Object.entries(node)) {
-      if (key === "entities" || key === "binding_values") {
-        continue;
-      }
-      walkForVideoInfo(value, addVariants, addMediaDetails, depth + 1);
-    }
-  }
-}
-
-function sourceRank(source) {
-  const text = String(source || "").toLowerCase();
-  if (text === "cdn.syndication") {
-    return 0;
-  }
-  if (text.includes(":retweeted")) {
-    return 1;
-  }
-  if (text.includes(":quoted")) {
-    return 2;
-  }
-  if (text.includes(":nested")) {
-    return 3;
-  }
-  return 4;
-}
-
-function compareVariantPriority(a, b) {
-  const ar = Number.isFinite(a?.rank) ? a.rank : sourceRank(a?.source);
-  const br = Number.isFinite(b?.rank) ? b.rank : sourceRank(b?.source);
-  if (ar !== br) {
-    return ar - br;
-  }
-  return (Number(b?.bitrate || 0) - Number(a?.bitrate || 0));
-}
-
-async function getSettings() {
-  const data = await chrome.storage.local.get([STORE_KEY_SETTINGS]);
-  return sanitizeSettings(data?.[STORE_KEY_SETTINGS]);
-}
-
-function sanitizeSettings(raw) {
-  const fallback = DEFAULT_SETTINGS;
-  const maxItems = clampInt(raw?.maxItems, 1, 200, fallback.maxItems);
-  const retentionHours = clampInt(raw?.retentionHours, 1, 24 * 30, fallback.retentionHours);
-  return { maxItems, retentionHours };
-}
-
-function clampInt(value, min, max, fallback) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) {
-    return fallback;
-  }
-  const i = Math.floor(n);
-  return Math.min(max, Math.max(min, i));
-}
-
-async function getStore() {
-  const data = await chrome.storage.local.get([STORE_KEY_BY_ID, STORE_KEY_HISTORY]);
-  return {
-    byId: data?.[STORE_KEY_BY_ID] && typeof data[STORE_KEY_BY_ID] === "object" ? data[STORE_KEY_BY_ID] : {},
-    history: Array.isArray(data?.[STORE_KEY_HISTORY]) ? data[STORE_KEY_HISTORY] : []
-  };
-}
-
-async function getPrunedStore(settingsOverride) {
-  const settings = settingsOverride || (await getSettings());
-  const store = await getStore();
-  const normalized = normalizeStore(store, settings);
-
-  if (normalized.changed) {
-    await chrome.storage.local.set({
-      [STORE_KEY_BY_ID]: normalized.byId,
-      [STORE_KEY_HISTORY]: normalized.history
-    });
-  }
-
-  return {
-    settings,
-    byId: normalized.byId,
-    history: normalized.history
-  };
-}
-
-function normalizeStore(store, settings) {
-  const cutoff = Date.now() - settings.retentionHours * 60 * 60 * 1000;
-  const map = new Map();
-
-  for (const [key, value] of Object.entries(store.byId || {})) {
-    const id = extractTweetId(key) || extractTweetId(value?.tweetId || "");
-    if (!id) {
-      continue;
-    }
-
-    const normalized = normalizeEntry({ ...value, tweetId: id });
-    map.set(id, normalized);
-  }
-
-  for (const item of store.history || []) {
-    const id = extractTweetId(item?.tweetId || "");
-    if (!id) {
-      continue;
-    }
-
-    const existing = map.get(id) || { tweetId: id, text: "" };
-    map.set(
-      id,
-      normalizeEntry({
-        ...existing,
-        ...item,
-        tweetId: id,
-        text: existing.text || ""
-      })
-    );
-  }
-
-  const entries = Array.from(map.values())
-    .filter((entry) => Number(entry.updatedAt || 0) >= cutoff)
-    .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))
-    .slice(0, settings.maxItems);
-
-  const byId = {};
-  const history = [];
-
-  for (const entry of entries) {
-    byId[entry.tweetId] = entry;
-    history.push(historyEntryFromRecord(entry));
-  }
-
-  const changed =
-    Object.keys(byId).length !== Object.keys(store.byId || {}).length ||
-    history.length !== (store.history || []).length ||
-    hasDifference(byId, store.byId || {}) ||
-    hasDifference(history, store.history || []);
-
-  return { byId, history, changed };
-}
-
-function normalizeEntry(entry) {
-  const tweetId = extractTweetId(entry?.tweetId || "") || "";
-  const tweetUrl = String(entry?.tweetUrl || makeTweetUrl(tweetId));
-  const title = buildTitleSnippet(entry?.title || "");
-  const preview = String(entry?.preview || "").slice(0, 600);
-
-  return {
-    tweetId,
-    tweetUrl,
-    title,
-    text: String(entry?.text || ""),
-    preview,
-    chars: Number(entry?.chars || 0),
-    source: entry?.source || null,
-    bitrate: Number(entry?.bitrate || 0),
-    updatedAt: Number(entry?.updatedAt || Date.now())
-  };
-}
-
-function historyEntryFromRecord(entry) {
-  return {
-    tweetId: entry.tweetId,
-    tweetUrl: String(entry.tweetUrl || makeTweetUrl(entry.tweetId)),
-    title: String(entry.title || ""),
-    preview: String(entry.preview || "").slice(0, 600),
-    chars: Number(entry.chars || 0),
-    updatedAt: Number(entry.updatedAt || 0)
-  };
-}
-
-function hasDifference(a, b) {
-  try {
-    return JSON.stringify(a) !== JSON.stringify(b);
-  } catch (_error) {
-    return true;
-  }
-}
-
-async function saveTranscriptEntry(entry, settingsOverride) {
-  const tweetId = extractTweetId(entry?.tweetId || "");
-  if (!tweetId) {
-    return;
-  }
-
-  const settings = settingsOverride || (await getSettings());
-  const store = await getStore();
-  const normalized = normalizeEntry({
-    ...entry,
-    tweetId,
-    tweetUrl: entry?.tweetUrl || makeTweetUrl(tweetId)
-  });
-
-  const byId = {
-    ...store.byId,
-    [tweetId]: normalized
-  };
-
-  const history = [
-    historyEntryFromRecord(normalized),
-    ...(store.history || []).filter((item) => extractTweetId(item?.tweetId || "") !== tweetId)
-  ];
-
-  const next = normalizeStore({ byId, history }, settings);
-  await chrome.storage.local.set({
-    [STORE_KEY_BY_ID]: next.byId,
-    [STORE_KEY_HISTORY]: next.history
-  });
 }
