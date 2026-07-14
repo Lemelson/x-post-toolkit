@@ -21,7 +21,8 @@
     "https://*.googleusercontent.com/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "content_scripts": [
     {
@@ -31,6 +32,8 @@
         "https://drive.google.com/*"
       ],
       "js": [
+        "content_x_adapter.js",
+        "content_drive_adapter.js",
         "content.js"
       ],
       "run_at": "document_idle"

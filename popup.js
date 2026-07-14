@@ -1,10 +1,12 @@
 "use strict";
 
-const TWEET_ID_RE = /\b(\d{8,30})\b/;
-const DRIVE_FILE_PATH_RE = /\/file\/d\/([a-zA-Z0-9_-]{10,})\b/;
-const DRIVE_FILE_QUERY_RE = /[?&]id=([a-zA-Z0-9_-]{10,})\b/;
-const ITEM_PREFIX_X = "x:";
-const ITEM_PREFIX_DRIVE = "gdrive:";
+import {
+  ITEM_PREFIX_DRIVE,
+  ITEM_PREFIX_X,
+  extractDriveFileId,
+  extractTweetId,
+  makeTweetUrl
+} from "./src/background/context.js";
 
 const pageInfoEl = document.getElementById("pageInfo");
 const statusEl = document.getElementById("status");
@@ -434,29 +436,6 @@ function extractContextFromUrl(rawUrl) {
   }
 
   return null;
-}
-
-function extractTweetId(text) {
-  const match = String(text || "").match(/status\/(\d{8,30})/);
-  if (match) {
-    return match[1];
-  }
-  const rawMatch = String(text || "").match(TWEET_ID_RE);
-  return rawMatch ? rawMatch[1] : null;
-}
-
-function extractDriveFileId(text) {
-  const value = String(text || "");
-  const pathMatch = value.match(DRIVE_FILE_PATH_RE);
-  if (pathMatch) {
-    return pathMatch[1];
-  }
-  const queryMatch = value.match(DRIVE_FILE_QUERY_RE);
-  return queryMatch ? queryMatch[1] : null;
-}
-
-function makeTweetUrl(tweetId) {
-  return `https://x.com/i/web/status/${tweetId}`;
 }
 
 async function runBusyAction(fn) {

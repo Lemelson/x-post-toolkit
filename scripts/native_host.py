@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import ipaddress
+import re
 import shutil
 import struct
 import subprocess
@@ -21,6 +23,15 @@ PARAKEET_MODEL = os.environ.get("XVDL_PARAKEET_MODEL", "mlx-community/parakeet-t
 FFMPEG_TIMEOUT = int(os.environ.get("XVDL_FFMPEG_TIMEOUT", "900"))
 ASR_TIMEOUT = int(os.environ.get("XVDL_ASR_TIMEOUT", "2400"))
 LOG_PATH = os.path.expanduser("~/Library/Logs/xvdl-native-host.log")
+MAX_MEDIA_URL_LENGTH = 8192
+ALLOWED_MEDIA_HOSTS = {
+  "video.twimg.com",
+  "drive.usercontent.google.com",
+}
+ALLOWED_MEDIA_HOST_SUFFIXES = (
+  ".googlevideo.com",
+  ".googleusercontent.com",
+)
 
 
 def log_line(message: str) -> None:
@@ -70,8 +81,60 @@ def read_message() -> dict[str, Any] | None:
 
 
 def is_valid_media_url(url: str) -> bool:
+  return validate_media_url(url)[0]
+
+
+def validate_media_url(url: str) -> tuple[bool, str]:
+  if not url or len(url) > MAX_MEDIA_URL_LENGTH:
+    return False, "URL is empty or too long."
+
   parsed = urlparse(url)
-  return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+  hostname = (parsed.hostname or "").lower().rstrip(".")
+  if parsed.scheme != "https" or not hostname:
+    return False, "Only HTTPS media URLs are supported."
+
+  if parsed.username or parsed.password:
+    return False, "Media URL credentials are not allowed."
+
+  if is_private_or_local_hostname(hostname):
+    return False, "Private or local media hosts are not allowed."
+
+  if hostname in ALLOWED_MEDIA_HOSTS:
+    return True, ""
+
+  if any(hostname.endswith(suffix) for suffix in ALLOWED_MEDIA_HOST_SUFFIXES):
+    return True, ""
+
+  return False, "Media host is not supported."
+
+
+def is_private_or_local_hostname(hostname: str) -> bool:
+  if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".local"):
+    return True
+
+  try:
+    ip = ipaddress.ip_address(hostname)
+  except ValueError:
+    return False
+
+  return (
+    ip.is_private
+    or ip.is_loopback
+    or ip.is_link_local
+    or ip.is_multicast
+    or ip.is_reserved
+    or ip.is_unspecified
+  )
+
+
+def error_payload(code: str, message: str) -> dict[str, Any]:
+  return {"ok": False, "code": code, "error": message}
+
+
+def public_command_error(stderr: str, fallback: str) -> str:
+  text = (stderr or "").strip() or fallback
+  text = re.sub(r"https?://\S+", "[media-url]", text)
+  return text[-500:]
 
 
 def run_cmd(cmd: list[str], timeout: int) -> None:
@@ -189,26 +252,29 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any]:
   copy_to_clipboard = bool(message.get("copyToClipboard", True))
 
   if not item_id:
-    return {"ok": False, "error": "itemId is required"}
-  if not is_valid_media_url(mp4_url):
-    return {"ok": False, "error": "mp4Url is invalid"}
+    return error_payload("INVALID_ITEM_ID", "itemId is required")
+
+  is_valid_url, url_error = validate_media_url(mp4_url)
+  if not is_valid_url:
+    log_line(f"error invalid-url item_id={item_id} reason={url_error}")
+    return error_payload("INVALID_MEDIA_URL", f"mp4Url is invalid: {url_error}")
 
   try:
     return transcribe(item_id, mp4_url, copy_to_clipboard)
   except FileNotFoundError as exc:
     log_line(f"error file-not-found item_id={item_id} error={exc}")
-    return {"ok": False, "error": str(exc)}
+    return error_payload("MISSING_DEPENDENCY", str(exc))
   except subprocess.TimeoutExpired as exc:
     log_line(f"error timeout item_id={item_id} cmd={' '.join(exc.cmd)}")
-    return {"ok": False, "error": f"Command timed out: {' '.join(exc.cmd)}"}
+    return error_payload("COMMAND_TIMEOUT", "Transcription command timed out.")
   except subprocess.CalledProcessError as exc:
     stderr = (exc.stderr or "").strip()
-    message = stderr[-800:] if stderr else f"Command failed: {' '.join(exc.cmd)}"
-    log_line(f"error cmd-failed item_id={item_id} message={message}")
-    return {"ok": False, "error": message}
+    message = public_command_error(stderr, f"Command failed: {' '.join(exc.cmd)}")
+    log_line(f"error cmd-failed item_id={item_id} message={stderr or message}")
+    return error_payload("COMMAND_FAILED", message)
   except Exception as exc:  # noqa: BLE001
     log_line(f"error unexpected item_id={item_id} error={exc}")
-    return {"ok": False, "error": str(exc)}
+    return error_payload("UNEXPECTED_ERROR", str(exc))
 
 
 def main() -> None:
@@ -220,7 +286,7 @@ def main() -> None:
     send_message(handle_request(message))
   except Exception as exc:  # noqa: BLE001
     log_line(f"fatal error={exc}")
-    send_message({"ok": False, "error": f"Native host fatal error: {exc}"})
+    send_message(error_payload("FATAL_ERROR", f"Native host fatal error: {exc}"))
 
 
 if __name__ == "__main__":

@@ -54,8 +54,11 @@ Most web downloader tools are external websites. This extension keeps the workfl
 
 ## Architecture
 
-- `content.js`: site adapters for X and Google Drive; injects action buttons and extracts page context.
-- `background.js`: universal item pipeline; resolves media URL, manages queue/cache/history/settings, calls native host.
+- `content.js`: shared content-script UI/lifecycle; delegates page-specific work to adapters.
+- `content_x_adapter.js`: X/Twitter DOM adapter; finds video posts and extracts post context.
+- `content_drive_adapter.js`: Google Drive preview adapter; finds the active player and extracts file context.
+- `background.js`: message router and transcript queue.
+- `src/background/*.js`: item context, media resolving, downloads, transcript storage/settings, native host calls.
 - `popup.html` + `popup.js`: popup UI, current-post actions, history, settings.
 - `scripts/native_host.py`: one-shot Native Messaging host for transcript pipeline.
 - `scripts/install_native_host.sh`: installs native host manifest for Chromium browsers.
@@ -75,6 +78,13 @@ Quick checks:
 python3 --version
 which ffmpeg
 which parakeet-mlx
+```
+
+## Development checks
+
+```bash
+npm test
+npm run check
 ```
 
 ## Installation
