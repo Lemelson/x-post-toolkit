@@ -1,19 +1,24 @@
 {
   "manifest_version": 3,
-  "name": "X Post Toolkit",
-  "version": "0.2.0",
-  "description": "Download X videos and generate local transcripts with one click.",
+  "name": "Video Toolkit",
+  "version": "0.3.0",
+  "description": "Download videos and generate local transcripts from X and Google Drive.",
   "permissions": [
     "downloads",
     "tabs",
     "nativeMessaging",
-    "storage"
+    "storage",
+    "clipboardWrite"
   ],
   "host_permissions": [
     "https://x.com/*",
     "https://twitter.com/*",
     "https://cdn.syndication.twimg.com/*",
-    "https://video.twimg.com/*"
+    "https://video.twimg.com/*",
+    "https://drive.google.com/*",
+    "https://drive.usercontent.google.com/*",
+    "https://*.googlevideo.com/*",
+    "https://*.googleusercontent.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -22,7 +27,8 @@
     {
       "matches": [
         "https://x.com/*",
-        "https://twitter.com/*"
+        "https://twitter.com/*",
+        "https://drive.google.com/*"
       ],
       "js": [
         "content.js"
@@ -31,7 +37,7 @@
     }
   ],
   "action": {
-    "default_title": "X Video Downloader",
+    "default_title": "Video Toolkit",
     "default_popup": "popup.html"
   }
 }

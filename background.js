@@ -1,6 +1,10 @@
 "use strict";
 
 const TWEET_ID_RE = /\b(\d{8,30})\b/;
+const DRIVE_FILE_PATH_RE = /\/file\/d\/([a-zA-Z0-9_-]{10,})\b/;
+const DRIVE_FILE_QUERY_RE = /[?&]id=([a-zA-Z0-9_-]{10,})\b/;
+const ITEM_PREFIX_X = "x:";
+const ITEM_PREFIX_DRIVE = "gdrive:";
 const NATIVE_HOST_NAME = "com.xvdl.transcriber";
 const CACHE_TTL_MS = 30 * 60 * 1000;
 const STORE_KEY_BY_ID = "transcriptsByTweetId";
@@ -23,9 +27,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     try {
       switch (message.type) {
         case "DOWNLOAD_TWEET_VIDEO":
+        case "DOWNLOAD_VIDEO_ITEM":
+        case "DOWNLOAD_PAGE_VIDEO":
           sendResponse(await handleDownloadMessage(message));
           return;
         case "TRANSCRIBE_TWEET_VIDEO":
+        case "TRANSCRIBE_VIDEO_ITEM":
+        case "TRANSCRIBE_PAGE_VIDEO":
           sendResponse(await handleTranscriptMessage(message));
           return;
         case "DEBUG_NATIVE_HOST":
@@ -35,10 +43,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           sendResponse(await getPopupState(message));
           return;
         case "GET_TRANSCRIPT_FOR_TWEET":
-          sendResponse(await getTranscriptForTweet(message));
+        case "GET_TRANSCRIPT_FOR_ITEM":
+          sendResponse(await getTranscriptForItem(message));
           return;
         case "DOWNLOAD_TWEET_TRANSCRIPT":
-          sendResponse(await downloadTranscriptForTweet(message));
+        case "DOWNLOAD_ITEM_TRANSCRIPT":
+          sendResponse(await downloadTranscriptForItem(message));
           return;
         case "CLEAR_TRANSCRIPT_HISTORY":
           sendResponse(await clearTranscriptHistory());
@@ -61,17 +71,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 async function handleDownloadMessage(message) {
-  const tweetId = extractTweetId(message.tweetId || message.tweetUrl || "");
-  if (!tweetId) {
-    throw new Error("Could not detect tweet ID.");
-  }
-
-  const media = await resolveBestMp4(tweetId);
-  const downloadId = await startVideoDownload(tweetId, media);
+  const context = getItemContext(message);
+  const media = await resolveBestMedia(context, "download");
+  const downloadId = await startVideoDownload(context, media);
 
   return {
     ok: true,
-    tweetId,
+    itemId: context.itemId,
+    platform: context.platform,
     source: media.source,
     bitrate: media.bitrate || null,
     url: media.url,
@@ -80,26 +87,23 @@ async function handleDownloadMessage(message) {
 }
 
 async function handleTranscriptMessage(message) {
-  const tweetId = extractTweetId(message.tweetId || message.tweetUrl || "");
-  if (!tweetId) {
-    throw new Error("Could not detect tweet ID.");
-  }
-
-  const meta = extractTweetMeta(message, tweetId);
+  const context = getItemContext(message);
   const now = Date.now();
   const store = await getPrunedStore();
-  const cached = store.byId?.[tweetId] || null;
+  const cached = store.byId?.[context.itemId] || null;
 
-  if (cached && now - Number(cached.updatedAt || 0) < CACHE_TTL_MS) {
+  if (cached?.text && now - Number(cached.updatedAt || 0) < CACHE_TTL_MS) {
     const leftMs = CACHE_TTL_MS - (now - Number(cached.updatedAt || 0));
-    if (shouldPatchMeta(cached, meta)) {
-      await saveTranscriptEntry({ ...cached, ...meta, tweetId }, store.settings);
+    if (shouldPatchMeta(cached, context)) {
+      await saveTranscriptEntry({ ...cached, ...context, itemId: context.itemId }, store.settings);
     }
 
     return {
       ok: true,
       cached: true,
-      tweetId,
+      itemId: context.itemId,
+      platform: context.platform,
+      text: String(cached.text || ""),
       chars: Number(cached.chars || 0),
       preview: String(cached.preview || ""),
       cacheTtlSec: Math.max(0, Math.floor(leftMs / 1000))
@@ -109,7 +113,7 @@ async function handleTranscriptMessage(message) {
   await setGlobalBadge("TXT", "#1d9bf0");
 
   try {
-    const result = await enqueueTranscript(tweetId, meta, store.settings);
+    const result = await enqueueTranscript(context, store.settings);
     await setGlobalBadge("OK", "#00ba7c");
     clearGlobalBadgeLater(3200);
     return result;
@@ -120,53 +124,56 @@ async function handleTranscriptMessage(message) {
   }
 }
 
-function enqueueTranscript(tweetId, meta, settings) {
-  const existing = inFlightTranscripts.get(tweetId);
+function enqueueTranscript(context, settings) {
+  const existing = inFlightTranscripts.get(context.itemId);
   if (existing) {
     return existing;
   }
 
-  const job = transcriptQueue.then(() => runTranscriptJob(tweetId, meta, settings));
+  const job = transcriptQueue.then(() => runTranscriptJob(context, settings));
   transcriptQueue = job.catch(() => undefined);
 
   const tracked = job.finally(() => {
-    inFlightTranscripts.delete(tweetId);
+    inFlightTranscripts.delete(context.itemId);
   });
-  inFlightTranscripts.set(tweetId, tracked);
+  inFlightTranscripts.set(context.itemId, tracked);
   return tracked;
 }
 
-async function runTranscriptJob(tweetId, meta, settings) {
+async function runTranscriptJob(context, settings) {
   const now = Date.now();
   const store = await getPrunedStore(settings);
-  const cached = store.byId?.[tweetId] || null;
-  if (cached && now - Number(cached.updatedAt || 0) < CACHE_TTL_MS) {
+  const cached = store.byId?.[context.itemId] || null;
+  if (cached?.text && now - Number(cached.updatedAt || 0) < CACHE_TTL_MS) {
     return {
       ok: true,
       cached: true,
-      tweetId,
+      itemId: context.itemId,
+      platform: context.platform,
+      text: String(cached.text || ""),
       chars: Number(cached.chars || 0),
       preview: String(cached.preview || ""),
       cacheTtlSec: Math.max(0, Math.floor((CACHE_TTL_MS - (now - Number(cached.updatedAt || 0))) / 1000))
     };
   }
 
-  const candidates = await resolveMp4Candidates(tweetId);
-  const transcriptResult = await transcribeWithFallback(tweetId, candidates);
+  const candidates = await resolveMediaCandidates(context, "transcript");
+  const transcriptResult = await transcribeWithFallback(context, candidates);
   const media = transcriptResult.media;
   const transcript = transcriptResult.transcript;
 
   await saveTranscriptEntry(
     {
-      tweetId,
+      itemId: context.itemId,
+      platform: context.platform,
+      itemUrl: context.itemUrl,
+      title: context.title,
       text: transcript.text,
       preview: transcript.preview,
       chars: transcript.charCount,
       source: media.source,
       bitrate: media.bitrate || null,
-      updatedAt: now,
-      tweetUrl: meta.tweetUrl,
-      title: meta.title
+      updatedAt: now
     },
     store.settings
   );
@@ -174,7 +181,8 @@ async function runTranscriptJob(tweetId, meta, settings) {
   return {
     ok: true,
     cached: false,
-    tweetId,
+    itemId: context.itemId,
+    platform: context.platform,
     source: media.source,
     bitrate: media.bitrate || null,
     chars: transcript.charCount,
@@ -183,21 +191,26 @@ async function runTranscriptJob(tweetId, meta, settings) {
 }
 
 async function getPopupState(message) {
-  const tweetId = extractTweetId(message?.tweetId || "");
+  const requestedId = normalizeItemId(
+    message?.itemId || message?.tweetId || "",
+    message?.platform,
+    message?.itemUrl || message?.tweetUrl || message?.pageUrl || ""
+  );
   const store = await getPrunedStore();
-  const current = tweetId ? store.byId?.[tweetId] : null;
+  const current = requestedId ? store.byId?.[requestedId] : null;
   const now = Date.now();
 
   return {
     ok: true,
-    tweetId: tweetId || null,
+    itemId: requestedId || null,
     cacheTtlSec: Math.floor(CACHE_TTL_MS / 1000),
     settings: store.settings,
     current: current
       ? {
-          tweetId: current.tweetId,
+          itemId: current.itemId,
+          itemUrl: String(current.itemUrl || ""),
           title: String(current.title || ""),
-          tweetUrl: String(current.tweetUrl || makeTweetUrl(current.tweetId)),
+          platform: String(current.platform || ""),
           chars: Number(current.chars || 0),
           preview: String(current.preview || ""),
           updatedAt: Number(current.updatedAt || 0),
@@ -205,9 +218,10 @@ async function getPopupState(message) {
         }
       : null,
     history: store.history.map((item) => ({
-      tweetId: item.tweetId,
+      itemId: item.itemId,
+      itemUrl: String(item.itemUrl || ""),
       title: String(item.title || ""),
-      tweetUrl: String(item.tweetUrl || makeTweetUrl(item.tweetId)),
+      platform: String(item.platform || ""),
       chars: Number(item.chars || 0),
       preview: String(item.preview || ""),
       updatedAt: Number(item.updatedAt || 0)
@@ -215,23 +229,20 @@ async function getPopupState(message) {
   };
 }
 
-async function getTranscriptForTweet(message) {
-  const tweetId = extractTweetId(message?.tweetId || "");
-  if (!tweetId) {
-    return { ok: false, error: "Could not detect tweet ID." };
-  }
-
+async function getTranscriptForItem(message) {
+  const context = getItemContext(message);
   const store = await getPrunedStore();
-  const entry = store.byId?.[tweetId] || null;
+  const entry = store.byId?.[context.itemId] || null;
   if (!entry?.text) {
-    return { ok: false, error: "Transcript not found for this tweet." };
+    return { ok: false, error: "Transcript not found for this video." };
   }
 
   return {
     ok: true,
-    tweetId,
+    itemId: context.itemId,
+    itemUrl: String(entry.itemUrl || ""),
     title: String(entry.title || ""),
-    tweetUrl: String(entry.tweetUrl || makeTweetUrl(tweetId)),
+    platform: String(entry.platform || context.platform || ""),
     text: String(entry.text),
     chars: Number(entry.chars || 0),
     preview: String(entry.preview || ""),
@@ -239,20 +250,16 @@ async function getTranscriptForTweet(message) {
   };
 }
 
-async function downloadTranscriptForTweet(message) {
-  const tweetId = extractTweetId(message?.tweetId || "");
-  if (!tweetId) {
-    return { ok: false, error: "Could not detect tweet ID." };
-  }
-
+async function downloadTranscriptForItem(message) {
+  const context = getItemContext(message);
   const store = await getPrunedStore();
-  const entry = store.byId?.[tweetId] || null;
+  const entry = store.byId?.[context.itemId] || null;
   if (!entry?.text) {
-    return { ok: false, error: "No transcript available for this tweet yet." };
+    return { ok: false, error: "No transcript available for this video yet." };
   }
 
-  const downloadId = await startTranscriptDownload(tweetId, String(entry.text));
-  return { ok: true, tweetId, downloadId };
+  const downloadId = await startTranscriptDownload(context, String(entry.text), entry.title);
+  return { ok: true, itemId: context.itemId, downloadId };
 }
 
 async function clearTranscriptHistory() {
@@ -276,6 +283,116 @@ async function updateTranscriptSettings(message) {
   return { ok: true, settings: next };
 }
 
+function getItemContext(message) {
+  const rawUrl = String(message?.itemUrl || message?.tweetUrl || message?.pageUrl || "");
+  const platform = detectPlatform(message);
+  const driveFileId = platform === "gdrive" ? extractDriveFileId(message?.fileId || "") || extractDriveFileId(rawUrl) : "";
+  const itemId = normalizeItemId(
+    message?.itemId || message?.tweetId || message?.fileId || "",
+    platform,
+    rawUrl,
+    driveFileId,
+    message?.title || message?.tweetText || message?.fileName || ""
+  );
+
+  if (!itemId) {
+    throw new Error("Could not detect video ID.");
+  }
+
+  const parsed = parseItemId(itemId);
+  const title = buildTitleSnippet(message?.title || message?.tweetText || message?.fileName || "");
+
+  return {
+    itemId,
+    platform: parsed.platform,
+    sourceId: parsed.sourceId,
+    fileId: driveFileId || deriveDriveFileIdFromItemId(itemId),
+    itemUrl: normalizeItemUrl(parsed.platform, parsed.sourceId, rawUrl, driveFileId || deriveDriveFileIdFromItemId(itemId)),
+    title,
+    mediaUrl: normalizeMediaUrl(message?.mediaUrl || "")
+  };
+}
+
+function detectPlatform(message) {
+  const explicit = String(message?.platform || "").trim().toLowerCase();
+  if (explicit === "x" || explicit === "twitter") {
+    return "x";
+  }
+  if (explicit === "gdrive" || explicit === "drive" || explicit === "google-drive") {
+    return "gdrive";
+  }
+
+  const raw = [
+    message?.itemId,
+    message?.tweetId,
+    message?.fileId,
+    message?.itemUrl,
+    message?.tweetUrl,
+    message?.pageUrl
+  ]
+    .map((value) => String(value || ""))
+    .find(Boolean);
+
+  if (extractDriveFileId(raw || "")) {
+    return "gdrive";
+  }
+  return "x";
+}
+
+function normalizeItemId(input, platformHint, rawUrl, driveFileIdHint, titleHint) {
+  const text = String(input || "").trim();
+  if (!text && !rawUrl) {
+    return null;
+  }
+
+  if (text.startsWith(ITEM_PREFIX_X) || text.startsWith(ITEM_PREFIX_DRIVE)) {
+    return text;
+  }
+
+  const platform = platformHint || (extractDriveFileId(text || rawUrl) ? "gdrive" : "x");
+  if (platform === "gdrive") {
+    const fileId = extractDriveFileId(text) || driveFileIdHint || extractDriveFileId(rawUrl);
+    if (fileId) {
+      return `${ITEM_PREFIX_DRIVE}${fileId}`;
+    }
+
+    const seed = rawUrl || text || String(titleHint || "");
+    return seed ? `${ITEM_PREFIX_DRIVE}page_${hashString(seed)}` : null;
+  }
+
+  const tweetId = extractTweetId(text) || extractTweetId(rawUrl);
+  return tweetId ? `${ITEM_PREFIX_X}${tweetId}` : null;
+}
+
+function parseItemId(itemId) {
+  const text = String(itemId || "");
+  if (text.startsWith(ITEM_PREFIX_X)) {
+    return {
+      itemId: text,
+      platform: "x",
+      sourceId: text.slice(ITEM_PREFIX_X.length)
+    };
+  }
+  if (text.startsWith(ITEM_PREFIX_DRIVE)) {
+    return {
+      itemId: text,
+      platform: "gdrive",
+      sourceId: text.slice(ITEM_PREFIX_DRIVE.length)
+    };
+  }
+
+  const normalized = normalizeItemId(text);
+  if (normalized && normalized !== text) {
+    return parseItemId(normalized);
+  }
+
+  return {
+    itemId: text,
+    platform: "x",
+    sourceId: text
+  };
+}
+
 function extractTweetId(input) {
   const text = String(input || "");
   const statusMatch = text.match(/status\/(\d{8,30})/);
@@ -286,20 +403,89 @@ function extractTweetId(input) {
   return rawMatch ? rawMatch[1] : null;
 }
 
+function extractDriveFileId(input) {
+  const text = String(input || "");
+  const pathMatch = text.match(DRIVE_FILE_PATH_RE);
+  if (pathMatch) {
+    return pathMatch[1];
+  }
+  const queryMatch = text.match(DRIVE_FILE_QUERY_RE);
+  return queryMatch ? queryMatch[1] : null;
+}
+
+function deriveDriveFileIdFromItemId(itemId) {
+  const parsed = parseItemId(itemId);
+  if (parsed.platform !== "gdrive") {
+    return "";
+  }
+  return /^[a-zA-Z0-9_-]{10,}$/.test(parsed.sourceId) ? parsed.sourceId : "";
+}
+
+function normalizeItemUrl(platform, sourceId, rawUrl, driveFileId) {
+  const text = String(rawUrl || "").trim();
+
+  if (platform === "gdrive") {
+    const fileId = driveFileId || deriveDriveFileIdFromItemId(`${ITEM_PREFIX_DRIVE}${sourceId}`);
+    if (text) {
+      return text;
+    }
+    if (fileId) {
+      return buildDriveViewUrl(fileId, text);
+    }
+    return "https://drive.google.com/";
+  }
+
+  return makeTweetUrl(sourceId);
+}
+
 function makeTweetUrl(tweetId) {
   return `https://x.com/i/web/status/${tweetId}`;
 }
 
-function extractTweetMeta(message, tweetId) {
-  const title = buildTitleSnippet(message?.tweetText || message?.title || "");
-  const urlFromInput = String(message?.tweetUrl || "");
-  const parsedId = extractTweetId(urlFromInput);
-  const normalizedId = parsedId || tweetId;
+function buildDriveViewUrl(fileId, rawUrl) {
+  const url = new URL(`https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`);
+  const resourceKey = tryGetSearchParam(rawUrl, "resourcekey");
+  if (resourceKey) {
+    url.searchParams.set("resourcekey", resourceKey);
+  }
+  return url.toString();
+}
 
-  return {
-    title,
-    tweetUrl: makeTweetUrl(normalizedId)
-  };
+function buildDriveDownloadUrl(fileId, rawUrl) {
+  const url = new URL("https://drive.usercontent.google.com/download");
+  url.searchParams.set("id", fileId);
+  url.searchParams.set("export", "download");
+  url.searchParams.set("confirm", "t");
+
+  const resourceKey = tryGetSearchParam(rawUrl, "resourcekey");
+  if (resourceKey) {
+    url.searchParams.set("resourcekey", resourceKey);
+  }
+
+  return url.toString();
+}
+
+function tryGetSearchParam(rawUrl, key) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    return url.searchParams.get(key) || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function normalizeMediaUrl(rawUrl) {
+  const text = String(rawUrl || "").trim();
+  if (!text) {
+    return "";
+  }
+
+  try {
+    const url = new URL(text);
+    return /^https?:$/.test(url.protocol) ? url.toString() : "";
+  } catch (_error) {
+    return "";
+  }
 }
 
 function buildTitleSnippet(text) {
@@ -321,28 +507,69 @@ function buildTitleSnippet(text) {
 }
 
 function shouldPatchMeta(entry, meta) {
-  return (!entry.title && !!meta.title) || (!entry.tweetUrl && !!meta.tweetUrl);
+  return (
+    (!entry.title && !!meta.title) ||
+    (!entry.itemUrl && !!meta.itemUrl) ||
+    (!entry.platform && !!meta.platform)
+  );
 }
 
-async function startVideoDownload(tweetId, media) {
-  const filename = `x_${tweetId}_${media.bitrate || "best"}.mp4`;
+async function startVideoDownload(context, media) {
+  const stem = buildFileStem(context, context.title || media.filenameHint || context.sourceId, media.bitrate);
+  const extension = guessExtension(media.url, ".mp4");
   return chrome.downloads.download({
     url: media.url,
-    filename,
+    filename: `${stem}${extension}`,
     conflictAction: "uniquify",
     saveAs: false
   });
 }
 
-async function startTranscriptDownload(tweetId, text) {
-  const filename = `x_${tweetId}_transcript.txt`;
+async function startTranscriptDownload(context, text, title) {
+  const stem = buildFileStem(context, title || context.title || context.sourceId, null);
   const url = `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`;
   return chrome.downloads.download({
     url,
-    filename,
+    filename: `${stem}_transcript.txt`,
     conflictAction: "uniquify",
     saveAs: false
   });
+}
+
+function buildFileStem(context, label, bitrate) {
+  const safeLabel = sanitizeFilename(label || context.sourceId || "video");
+  if (context.platform === "x") {
+    return `x_${sanitizeFilename(context.sourceId || safeLabel)}${bitrate ? `_${bitrate}` : ""}`;
+  }
+  return `gdrive_${safeLabel}${bitrate ? `_${bitrate}` : ""}`;
+}
+
+function hashString(value) {
+  let hash = 0;
+  const text = String(value || "");
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+function sanitizeFilename(value) {
+  const text = String(value || "")
+    .replace(/[\\/:*?"<>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return text || "video";
+}
+
+function guessExtension(rawUrl, fallback) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    const match = url.pathname.match(/(\.[a-z0-9]{2,5})$/i);
+    return match ? match[1].toLowerCase() : fallback;
+  } catch (_error) {
+    return fallback;
+  }
 }
 
 async function setGlobalBadge(text, color) {
@@ -356,10 +583,11 @@ function clearGlobalBadgeLater(ms) {
   }, ms);
 }
 
-async function runNativeTranscription(tweetId, mp4Url) {
+async function runNativeTranscription(itemId, mp4Url) {
   const response = await sendNativeMessage({
     type: "transcribe",
-    tweetId,
+    itemId,
+    tweetId: itemId,
     mp4Url,
     copyToClipboard: true
   });
@@ -375,12 +603,12 @@ async function runNativeTranscription(tweetId, mp4Url) {
   };
 }
 
-async function transcribeWithFallback(tweetId, candidates) {
+async function transcribeWithFallback(context, candidates) {
   let lastError = null;
 
   for (const media of candidates) {
     try {
-      const transcript = await runNativeTranscription(tweetId, media.url);
+      const transcript = await runNativeTranscription(context.itemId, media.url);
       return { media, transcript };
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
@@ -391,9 +619,9 @@ async function transcribeWithFallback(tweetId, candidates) {
   }
 
   if (lastError) {
-    throw new Error(`No usable audio stream found across MP4 variants. Last error: ${lastError.message}`);
+    throw new Error(`No usable audio stream found across video variants. Last error: ${lastError.message}`);
   }
-  throw new Error("No MP4 candidates available for transcript.");
+  throw new Error("No video candidates available for transcript.");
 }
 
 function isRecoverableAudioError(error) {
@@ -452,9 +680,63 @@ function sendNativeMessage(payload) {
   });
 }
 
-async function resolveBestMp4(tweetId) {
-  const candidates = await resolveMp4Candidates(tweetId);
+async function resolveBestMedia(context, purpose) {
+  const candidates = await resolveMediaCandidates(context, purpose);
   return candidates[0];
+}
+
+async function resolveMediaCandidates(context, purpose) {
+  const candidates = [];
+  const seen = new Set();
+
+  const push = (media) => {
+    const url = normalizeMediaUrl(media?.url || "");
+    if (!url || seen.has(url)) {
+      return;
+    }
+    seen.add(url);
+    candidates.push({
+      source: media?.source || `${context.platform}.dom`,
+      url,
+      bitrate: Number(media?.bitrate || 0),
+      filenameHint: media?.filenameHint || ""
+    });
+  };
+
+  if (context.mediaUrl) {
+    push({
+      source: `${context.platform}.dom`,
+      url: context.mediaUrl,
+      filenameHint: context.title || context.sourceId
+    });
+  }
+
+  if (context.platform === "x") {
+    const xCandidates = await resolveMp4Candidates(context.sourceId);
+    for (const media of xCandidates) {
+      push(media);
+    }
+  } else if (context.platform === "gdrive" && context.fileId) {
+    push({
+      source: "gdrive.download",
+      url: buildDriveDownloadUrl(context.fileId, context.itemUrl),
+      filenameHint: context.title || context.sourceId
+    });
+  }
+
+  if (!candidates.length && context.platform === "gdrive") {
+    throw new Error(
+      purpose === "transcript"
+        ? "Google Drive video URL is not available yet. Start playback and try again."
+        : "Could not resolve a downloadable Google Drive video URL."
+    );
+  }
+
+  if (!candidates.length) {
+    throw new Error("No downloadable MP4 found.");
+  }
+
+  return candidates;
 }
 
 async function resolveMp4Candidates(tweetId) {
@@ -493,7 +775,8 @@ async function getFromSyndication(tweetId) {
   return variants.map((variant) => ({
     source: variant.source || "cdn.syndication",
     url: variant.url,
-    bitrate: variant.bitrate || 0
+    bitrate: variant.bitrate || 0,
+    filenameHint: tweetId
   }));
 }
 
@@ -608,7 +891,7 @@ function compareVariantPriority(a, b) {
   if (ar !== br) {
     return ar - br;
   }
-  return (Number(b?.bitrate || 0) - Number(a?.bitrate || 0));
+  return Number(b?.bitrate || 0) - Number(a?.bitrate || 0);
 }
 
 async function getSettings() {
@@ -664,34 +947,36 @@ function normalizeStore(store, settings) {
   const map = new Map();
 
   for (const [key, value] of Object.entries(store.byId || {})) {
-    const id = extractTweetId(key) || extractTweetId(value?.tweetId || "");
-    if (!id) {
+    const normalized = normalizeEntry({
+      ...value,
+      itemId: value?.itemId || key,
+      tweetId: value?.tweetId || key
+    });
+    if (!normalized) {
       continue;
     }
-
-    const normalized = normalizeEntry({ ...value, tweetId: id });
-    map.set(id, normalized);
+    map.set(normalized.itemId, normalized);
   }
 
   for (const item of store.history || []) {
-    const id = extractTweetId(item?.tweetId || "");
-    if (!id) {
+    const normalized = normalizeEntry(item);
+    if (!normalized) {
       continue;
     }
 
-    const existing = map.get(id) || { tweetId: id, text: "" };
+    const existing = map.get(normalized.itemId) || { ...normalized, text: "" };
     map.set(
-      id,
+      normalized.itemId,
       normalizeEntry({
         ...existing,
-        ...item,
-        tweetId: id,
-        text: existing.text || ""
+        ...normalized,
+        text: existing.text || normalized.text || ""
       })
     );
   }
 
   const entries = Array.from(map.values())
+    .filter(Boolean)
     .filter((entry) => Number(entry.updatedAt || 0) >= cutoff)
     .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))
     .slice(0, settings.maxItems);
@@ -700,7 +985,7 @@ function normalizeStore(store, settings) {
   const history = [];
 
   for (const entry of entries) {
-    byId[entry.tweetId] = entry;
+    byId[entry.itemId] = entry;
     history.push(historyEntryFromRecord(entry));
   }
 
@@ -714,14 +999,33 @@ function normalizeStore(store, settings) {
 }
 
 function normalizeEntry(entry) {
-  const tweetId = extractTweetId(entry?.tweetId || "") || "";
-  const tweetUrl = String(entry?.tweetUrl || makeTweetUrl(tweetId));
+  const driveFileId = extractDriveFileId(entry?.fileId || "") || extractDriveFileId(entry?.itemUrl || entry?.tweetUrl || "");
+  const itemId = normalizeItemId(
+    entry?.itemId || entry?.tweetId || "",
+    entry?.platform,
+    entry?.itemUrl || entry?.tweetUrl || "",
+    driveFileId,
+    entry?.title || ""
+  );
+  if (!itemId) {
+    return null;
+  }
+
+  const parsed = parseItemId(itemId);
+  const itemUrl = normalizeItemUrl(
+    parsed.platform,
+    parsed.sourceId,
+    entry?.itemUrl || entry?.tweetUrl || "",
+    driveFileId || deriveDriveFileIdFromItemId(itemId)
+  );
   const title = buildTitleSnippet(entry?.title || "");
   const preview = String(entry?.preview || "").slice(0, 600);
 
   return {
-    tweetId,
-    tweetUrl,
+    itemId,
+    itemUrl,
+    fileId: driveFileId || deriveDriveFileIdFromItemId(itemId),
+    platform: parsed.platform,
     title,
     text: String(entry?.text || ""),
     preview,
@@ -734,8 +1038,9 @@ function normalizeEntry(entry) {
 
 function historyEntryFromRecord(entry) {
   return {
-    tweetId: entry.tweetId,
-    tweetUrl: String(entry.tweetUrl || makeTweetUrl(entry.tweetId)),
+    itemId: entry.itemId,
+    itemUrl: String(entry.itemUrl || ""),
+    platform: String(entry.platform || ""),
     title: String(entry.title || ""),
     preview: String(entry.preview || "").slice(0, 600),
     chars: Number(entry.chars || 0),
@@ -752,27 +1057,21 @@ function hasDifference(a, b) {
 }
 
 async function saveTranscriptEntry(entry, settingsOverride) {
-  const tweetId = extractTweetId(entry?.tweetId || "");
-  if (!tweetId) {
+  const normalized = normalizeEntry(entry);
+  if (!normalized) {
     return;
   }
 
   const settings = settingsOverride || (await getSettings());
   const store = await getStore();
-  const normalized = normalizeEntry({
-    ...entry,
-    tweetId,
-    tweetUrl: entry?.tweetUrl || makeTweetUrl(tweetId)
-  });
-
   const byId = {
     ...store.byId,
-    [tweetId]: normalized
+    [normalized.itemId]: normalized
   };
 
   const history = [
     historyEntryFromRecord(normalized),
-    ...(store.history || []).filter((item) => extractTweetId(item?.tweetId || "") !== tweetId)
+    ...(store.history || []).filter((item) => normalizeItemId(item?.itemId || item?.tweetId || "", item?.platform, item?.itemUrl || item?.tweetUrl || "") !== normalized.itemId)
   ];
 
   const next = normalizeStore({ byId, history }, settings);

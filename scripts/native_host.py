@@ -94,7 +94,7 @@ def find_transcript_file(directory: str) -> Path:
   return txt_files[0]
 
 
-def transcribe(tweet_id: str, mp4_url: str, copy_to_clipboard: bool) -> dict[str, Any]:
+def transcribe(item_id: str, mp4_url: str, copy_to_clipboard: bool) -> dict[str, Any]:
   started = time.time()
   ffmpeg = resolve_executable(
     FFMPEG_BIN,
@@ -109,9 +109,11 @@ def transcribe(tweet_id: str, mp4_url: str, copy_to_clipboard: bool) -> dict[str
     ],
   )
 
-  log_line(f"transcribe start tweet_id={tweet_id} ffmpeg={ffmpeg} parakeet={parakeet}")
+  log_line(f"transcribe start item_id={item_id} ffmpeg={ffmpeg} parakeet={parakeet}")
 
-  with tempfile.TemporaryDirectory(prefix=f"xvdl_{tweet_id}_") as tmpdir:
+  safe_item_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in item_id)[:80] or "item"
+
+  with tempfile.TemporaryDirectory(prefix=f"xvdl_{safe_item_id}_") as tmpdir:
     audio_path = str(Path(tmpdir) / "audio.wav")
 
     run_cmd(
@@ -156,10 +158,11 @@ def transcribe(tweet_id: str, mp4_url: str, copy_to_clipboard: bool) -> dict[str
       subprocess.run(["pbcopy"], input=transcript.encode("utf-8"), check=True)
 
   elapsed_ms = int((time.time() - started) * 1000)
-  log_line(f"transcribe done tweet_id={tweet_id} chars={len(transcript)} elapsed_ms={elapsed_ms}")
+  log_line(f"transcribe done item_id={item_id} chars={len(transcript)} elapsed_ms={elapsed_ms}")
   return {
     "ok": True,
-    "tweetId": tweet_id,
+    "itemId": item_id,
+    "tweetId": item_id,
     "transcript": transcript,
     "charCount": len(transcript),
     "elapsedMs": elapsed_ms,
@@ -181,30 +184,30 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any]:
   if msg_type != "transcribe":
     return {"ok": False, "error": f"Unsupported message type: {msg_type or 'empty'}"}
 
-  tweet_id = str(message.get("tweetId", "")).strip()
+  item_id = str(message.get("itemId") or message.get("tweetId") or "").strip()
   mp4_url = str(message.get("mp4Url", "")).strip()
   copy_to_clipboard = bool(message.get("copyToClipboard", True))
 
-  if not tweet_id:
-    return {"ok": False, "error": "tweetId is required"}
+  if not item_id:
+    return {"ok": False, "error": "itemId is required"}
   if not is_valid_media_url(mp4_url):
     return {"ok": False, "error": "mp4Url is invalid"}
 
   try:
-    return transcribe(tweet_id, mp4_url, copy_to_clipboard)
+    return transcribe(item_id, mp4_url, copy_to_clipboard)
   except FileNotFoundError as exc:
-    log_line(f"error file-not-found tweet_id={tweet_id} error={exc}")
+    log_line(f"error file-not-found item_id={item_id} error={exc}")
     return {"ok": False, "error": str(exc)}
   except subprocess.TimeoutExpired as exc:
-    log_line(f"error timeout tweet_id={tweet_id} cmd={' '.join(exc.cmd)}")
+    log_line(f"error timeout item_id={item_id} cmd={' '.join(exc.cmd)}")
     return {"ok": False, "error": f"Command timed out: {' '.join(exc.cmd)}"}
   except subprocess.CalledProcessError as exc:
     stderr = (exc.stderr or "").strip()
     message = stderr[-800:] if stderr else f"Command failed: {' '.join(exc.cmd)}"
-    log_line(f"error cmd-failed tweet_id={tweet_id} message={message}")
+    log_line(f"error cmd-failed item_id={item_id} message={message}")
     return {"ok": False, "error": message}
   except Exception as exc:  # noqa: BLE001
-    log_line(f"error unexpected tweet_id={tweet_id} error={exc}")
+    log_line(f"error unexpected item_id={item_id} error={exc}")
     return {"ok": False, "error": str(exc)}
 
 

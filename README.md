@@ -1,8 +1,9 @@
-# X Post Toolkit
+# Video Toolkit
 
-Chrome/Chromium extension for X (Twitter):
-- download the best MP4 from a video post,
-- transcribe post audio locally,
+Chrome/Chromium extension for video pages:
+- download the best available video from X posts,
+- transcribe video audio locally,
+- run the same flow on Google Drive video preview pages,
 - keep a configurable transcript history in the popup.
 
 This project is designed for privacy-first local use on macOS and works in Chrome, Comet, Arc, Brave, Edge, Vivaldi, Chromium, and Opera (via Native Messaging host install script).
@@ -10,17 +11,20 @@ This project is designed for privacy-first local use on macOS and works in Chrom
 ## Why this project
 
 Most web downloader tools are external websites. This extension keeps the workflow inside your browser:
-- inline buttons directly on X posts,
+- inline buttons directly on supported video pages,
 - local transcription (no cloud upload required),
 - transcript copied to clipboard automatically,
 - quick access to recent transcripts in popup.
 
 ## Features
 
-- Inline post actions in X feed and post page:
+- Inline actions in supported pages:
   - `Download` (best MP4)
   - `Transcript` (local ASR + clipboard)
-- Popup actions for current post:
+- Current MVP supports:
+  - X / Twitter posts with video
+  - Google Drive file preview pages with video
+- Popup actions for current video:
   - `Transcript Current`
   - `Download Video`
   - `Download Transcript (.txt)`
@@ -29,7 +33,7 @@ Most web downloader tools are external websites. This extension keeps the workfl
 - Configurable history policy:
   - max items (default: 10)
   - retention window (default: 3 days / 72 hours)
-- 30-minute per-post transcript cache (no repeated model run)
+- 30-minute per-video transcript cache (no repeated model run)
 - Sequential queue for transcript jobs (if you click multiple posts quickly)
 - Source priority for posts with multiple videos:
   - primary post video first,
@@ -50,8 +54,8 @@ Most web downloader tools are external websites. This extension keeps the workfl
 
 ## Architecture
 
-- `content.js`: injects action buttons into X UI and sends post metadata.
-- `background.js`: resolves media URL, manages queue/cache/history/settings, calls native host.
+- `content.js`: site adapters for X and Google Drive; injects action buttons and extracts page context.
+- `background.js`: universal item pipeline; resolves media URL, manages queue/cache/history/settings, calls native host.
 - `popup.html` + `popup.js`: popup UI, current-post actions, history, settings.
 - `scripts/native_host.py`: one-shot Native Messaging host for transcript pipeline.
 - `scripts/install_native_host.sh`: installs native host manifest for Chromium browsers.
@@ -101,23 +105,23 @@ If auto-detection fails, pass extension ID manually:
 
 After install:
 1. Reload extension.
-2. Refresh X tab.
+2. Refresh X or Google Drive tab.
 
 ## Usage
 
 ### Download video
 
-Click `Download` under a video post.
+Click `Download` on a supported video page.
 
 ### Transcribe
 
-Click `Transcript` under a video post:
+Click `Transcript` on a supported video page:
 1. extension resolves best MP4 URL,
 2. native host runs `ffmpeg` and `parakeet-mlx`,
 3. transcript is copied to clipboard,
 4. result is stored in history.
 
-If you click transcript again for the same post within 30 minutes, cache is used.
+If you click transcript again for the same video within 30 minutes, cache is used.
 
 ### Popup
 
@@ -125,6 +129,19 @@ Click extension icon to open popup:
 - run actions for current post,
 - browse recent transcripts,
 - configure history limits.
+
+## Google Drive MVP notes
+
+- The Drive integration uses the active HTML5 video element on the preview page.
+- For transcript, the extension prefers the current direct video URL exposed by the player.
+- If Drive has not exposed a direct media URL yet, start playback once and retry transcript.
+- Download on Drive falls back to a file download endpoint when possible.
+
+## Expansion roadmap
+
+Ideas for turning this into a universal video extension live in:
+
+- `UNIVERSAL_VIDEO_EXPANSION.md`
 
 ## NVIDIA Parakeet / Spokenly note
 
