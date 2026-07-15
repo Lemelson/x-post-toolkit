@@ -104,8 +104,8 @@ export function buildTranscriptOutput(entry, settings, format = "default") {
     const author = formatAuthorLine(entry);
     const header = [
       author,
-      `Above is tweet text:\n${tweetText}`,
-      `Below is video transcript:\n${body}`
+      `Tweet text:\n${tweetText}`,
+      `Video transcript:\n${body}`
     ].filter(Boolean);
     return header.join("\n\n");
   }

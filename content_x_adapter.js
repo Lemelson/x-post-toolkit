@@ -11,6 +11,7 @@
       '[data-testid="reply"], [data-testid="retweet"], [data-testid="unretweet"], [data-testid="like"], [data-testid="unlike"], [data-testid="bookmark"], [data-testid="share"]';
     const VIDEO_HINT_SELECTOR =
       '[data-testid="videoComponent"], [data-testid="videoPlayer"], [data-testid="previewInterstitial"], video, a[href*="/video/"]';
+    const VIDEO_PLAYER_SELECTOR = '[data-testid="videoPlayer"]';
     const GROK_ACTION_SELECTOR =
       '[data-testid*="grok" i], button[aria-label*="grok" i], a[aria-label*="grok" i], a[href*="/i/grok"]';
     const SHARE_ACTION_SELECTOR =
@@ -28,8 +29,17 @@
         for (const tweet of tweets) {
           injectTweetButtons(tweet);
         }
+
+        const players = collectVideoPlayers(root);
+        for (const player of players) {
+          syncPlayerButtons(player);
+        }
       },
       getButtonContext(button) {
+        const player = button.closest(VIDEO_PLAYER_SELECTOR);
+        if (player) {
+          return extractPlayerMeta(player);
+        }
         return extractTweetMeta(button.closest(TWEET_SELECTOR));
       },
       getVisibleContext() {
@@ -56,6 +66,25 @@
       return found;
     }
 
+    function collectVideoPlayers(root) {
+      const found = new Set();
+      if (root instanceof Element) {
+        if (root.matches?.(VIDEO_PLAYER_SELECTOR)) {
+          found.add(root);
+        }
+        const closest = root.closest?.(VIDEO_PLAYER_SELECTOR);
+        if (closest) {
+          found.add(closest);
+        }
+      }
+
+      const nested = root.querySelectorAll?.(VIDEO_PLAYER_SELECTOR) || [];
+      for (const player of nested) {
+        found.add(player);
+      }
+      return found;
+    }
+
     function injectTweetButtons(tweet) {
       if (!(tweet instanceof Element)) {
         return;
@@ -69,7 +98,7 @@
         return;
       }
 
-      const existing = tweet.querySelector(`.${api.ACTIONS_CLASS}`);
+      const existing = tweet.querySelector(`.${api.ACTIONS_CLASS}[data-variant="compact"]`);
       if (existing) {
         api.syncButtonsMeta(existing, meta);
         return;
@@ -86,6 +115,102 @@
         return;
       }
       insertInActionBar(actionBar, actions);
+    }
+
+    function syncPlayerButtons(player) {
+      const existing = player.querySelector(`.${api.ACTIONS_CLASS}[data-variant="player"]`);
+      if (!shouldShowPlayerButtons(player)) {
+        existing?.remove();
+        return;
+      }
+
+      const meta = extractPlayerMeta(player);
+      if (!meta.itemId) {
+        existing?.remove();
+        return;
+      }
+
+      if (existing) {
+        api.syncButtonsMeta(existing, meta);
+        return;
+      }
+
+      const controls = findPlayerControls(player);
+      if (!controls) {
+        return;
+      }
+
+      const actions = api.createActionWrapper(meta, "player", "x");
+      const captions = controls.querySelector('[data-testid="captions"]');
+      const captionsTarget = findDirectChild(controls, captions);
+      controls.insertBefore(actions, captionsTarget?.nextSibling || controls.firstChild);
+    }
+
+    function shouldShowPlayerButtons(player) {
+      if (/\/status\/\d{8,30}\/video\/\d+/.test(location.pathname)) {
+        return true;
+      }
+
+      const fullscreen = document.fullscreenElement;
+      return !!fullscreen && (fullscreen.contains(player) || player.contains(fullscreen));
+    }
+
+    function findPlayerControls(player) {
+      const buttons = Array.from(player.querySelectorAll('button, [role="button"]'));
+      const anchor = player.querySelector('[data-testid="captions"]') || buttons[buttons.length - 1];
+      if (!anchor) {
+        return null;
+      }
+
+      let node = anchor.parentElement;
+      while (node && node !== player) {
+        if (node.querySelectorAll('button, [role="button"]').length >= 2) {
+          return node;
+        }
+        node = node.parentElement;
+      }
+      return null;
+    }
+
+    function findDirectChild(parent, descendant) {
+      if (!parent || !descendant) {
+        return null;
+      }
+
+      let node = descendant;
+      while (node && node.parentElement !== parent) {
+        node = node.parentElement;
+      }
+      return node?.parentElement === parent ? node : null;
+    }
+
+    function extractPlayerMeta(player) {
+      const currentSourceId = extractStatusId(location.pathname);
+      const tweet = player.closest(TWEET_SELECTOR) || findTweetBySourceId(currentSourceId);
+      const meta = extractTweetMeta(tweet);
+      if (meta.itemId || !currentSourceId) {
+        return meta;
+      }
+
+      return {
+        ...meta,
+        itemId: `${ITEM_PREFIX_X}${currentSourceId}`,
+        itemUrl: makeTweetUrl(currentSourceId)
+      };
+    }
+
+    function findTweetBySourceId(sourceId) {
+      if (!sourceId) {
+        return null;
+      }
+
+      const tweets = document.querySelectorAll(TWEET_SELECTOR);
+      for (const tweet of tweets) {
+        if (extractTweetSourceId(tweet) === sourceId) {
+          return tweet;
+        }
+      }
+      return null;
     }
 
     function hasVideoCandidate(tweet) {
@@ -179,6 +304,7 @@
         tweetText: "",
         authorName: "",
         authorHandle: "",
+        avatarUrl: "",
         platform: "x",
         mediaUrl: "",
         fileId: ""
@@ -205,6 +331,7 @@
         tweetText,
         authorName: author.authorName,
         authorHandle: author.authorHandle,
+        avatarUrl: author.avatarUrl,
         platform: "x",
         mediaUrl: "",
         fileId: ""
@@ -219,6 +346,7 @@
         tweetText: "",
         authorName: "",
         authorHandle: "",
+        avatarUrl: "",
         platform: "x",
         mediaUrl: "",
         fileId: ""
@@ -244,6 +372,10 @@
       }
 
       return null;
+    }
+
+    function extractStatusId(value) {
+      return String(value || "").match(/status\/(\d{8,30})/)?.[1] || null;
     }
 
     function extractTweetText(tweetEl) {
@@ -273,7 +405,7 @@
     function extractTweetAuthor(tweetEl) {
       const userName = tweetEl.querySelector('[data-testid="User-Name"]');
       if (!userName) {
-        return { authorName: "", authorHandle: "" };
+        return { authorName: "", authorHandle: "", avatarUrl: extractTweetAvatarUrl(tweetEl) };
       }
 
       const raw = typeof userName.innerText === "string" && userName.innerText
@@ -289,7 +421,20 @@
           !/^\d+[smhdw]$/.test(line);
       }) || "";
 
-      return { authorName, authorHandle };
+      return { authorName, authorHandle, avatarUrl: extractTweetAvatarUrl(tweetEl) };
+    }
+
+    function extractTweetAvatarUrl(tweetEl) {
+      const image = tweetEl.querySelector(
+        '[data-testid="Tweet-User-Avatar"] img, [data-testid^="UserAvatar-Container-"] img, img[src*="profile_images"]'
+      );
+      const raw = image?.currentSrc || image?.getAttribute("src") || "";
+      try {
+        const url = new URL(raw, location.href);
+        return /^https?:$/.test(url.protocol) ? url.toString() : "";
+      } catch (_error) {
+        return "";
+      }
     }
 
     function normalizeText(value) {
