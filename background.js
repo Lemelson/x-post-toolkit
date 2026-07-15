@@ -121,6 +121,10 @@ async function handleTranscriptMessage(message, sender) {
     onProgress?.({ stage: "invalid-cache" });
   }
 
+  if (!inFlightTranscripts.has(context.itemId) && inFlightTranscripts.size > 0) {
+    onProgress?.({ stage: "queued" });
+  }
+
   await badgeJobStarted();
 
   try {

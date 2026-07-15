@@ -6,22 +6,22 @@ const BTN_CLASS = "xvdl-btn";
 const DRIVE_BTN_CLASS = "xvdl-btn--drive";
 const BTN_ROLE = "xvdl-action";
 const TOAST_CLASS = "xvdl-toast";
+const TASK_STACK_CLASS = "xvdl-task-stack";
+const TASK_CARD_CLASS = "xvdl-task-card";
 const DEFAULT_MESSAGE_TIMEOUT_MS = 60 * 1000;
 const DEBUG_MESSAGE_TIMEOUT_MS = 15 * 1000;
 const TRANSCRIPT_MESSAGE_TIMEOUT_MS = 135 * 60 * 1000;
-// Keep the current stage visible for the same window as the request. Success,
-// failure, or the request timeout replaces it with a terminal toast.
-const PROGRESS_TOAST_DURATION_MS = TRANSCRIPT_MESSAGE_TIMEOUT_MS;
 
-const PROGRESS_TOASTS = {
-  downloading: { text: "Downloading audio…", kind: "info" },
+const TRANSCRIPT_STAGES = {
+  queued: { text: "Waiting in queue", kind: "queued" },
+  downloading: { text: "Downloading audio…", kind: "work" },
   downloaded: { text: "Audio downloaded", kind: "step" },
-  transcribing: { text: "Audio verified. Transcribing…", kind: "work" },
-  "invalid-cache": { text: "Cached transcript is incomplete or unverified. Starting again…", kind: "step" },
-  "retrying-download": { text: "Audio download was interrupted. Retrying…", kind: "step" },
-  "retrying-transcription": { text: "Transcription was interrupted. Retrying…", kind: "step" }
+  transcribing: { text: "Transcribing…", kind: "work" },
+  "invalid-cache": { text: "Refreshing saved transcript…", kind: "step" },
+  "retrying-download": { text: "Retrying audio download…", kind: "step" },
+  "retrying-transcription": { text: "Retrying transcription…", kind: "step" }
 };
-let progressTransitionTimer = null;
+const transcriptTasks = new Map();
 
 const adapterApi = {
   ACTIONS_CLASS,
@@ -43,6 +43,8 @@ scanPage();
 observeDom();
 wireClickHandler();
 wireRuntimeHandler();
+wireTaskPanelHandler();
+document.addEventListener("fullscreenchange", scheduleScan);
 // Safety net for anything the MutationObserver misses (e.g. attribute-only
 // player swaps); the observer handles the common cases, so keep this rare.
 setInterval(() => scheduleScan(), 5000);
@@ -60,6 +62,17 @@ function injectStyles() {
       align-items: center;
       gap: 4px;
       margin-left: 2px;
+    }
+    .${ACTIONS_CLASS}[data-variant="player"] {
+      gap: 0;
+      margin: 0;
+      flex: 0 0 auto;
+    }
+    .${ACTIONS_CLASS}[data-variant="player"] .${BTN_CLASS} {
+      width: 34px;
+      min-width: 34px;
+      height: 34px;
+      color: #fff;
     }
     .${DRIVE_ACTIONS_CLASS} {
       display: flex;
@@ -159,6 +172,238 @@ function injectStyles() {
     @keyframes xvdl-spin {
       from { transform: rotate(0deg); }
       to { transform: rotate(360deg); }
+    }
+    .${TASK_STACK_CLASS} {
+      position: fixed;
+      top: 12px;
+      right: 16px;
+      z-index: 2147483647;
+      width: min(390px, calc(100vw - 24px));
+      max-height: calc(100dvh - 24px);
+      overflow-x: hidden;
+      overflow-y: auto;
+      display: grid;
+      gap: 10px;
+      padding: 2px;
+      pointer-events: none;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(113, 118, 123, 0.5) transparent;
+    }
+    .${TASK_CARD_CLASS} {
+      --xvdl-accent: rgb(29, 155, 240);
+      pointer-events: auto;
+      position: relative;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.13);
+      border-radius: 16px;
+      padding: 13px;
+      color: rgb(231, 233, 234);
+      background: rgba(22, 24, 28, 0.94);
+      box-shadow: 0 14px 38px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+      backdrop-filter: blur(18px) saturate(120%);
+      -webkit-backdrop-filter: blur(18px) saturate(120%);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      animation: xvdl-task-enter 240ms cubic-bezier(0.16, 1, 0.3, 1) both;
+    }
+    .${TASK_CARD_CLASS}[data-kind="done"] { --xvdl-accent: rgb(0, 186, 124); }
+    .${TASK_CARD_CLASS}[data-kind="error"] { --xvdl-accent: rgb(244, 33, 46); }
+    .${TASK_CARD_CLASS}[data-kind="step"],
+    .${TASK_CARD_CLASS}[data-kind="queued"] { --xvdl-accent: rgb(255, 179, 0); }
+    .${TASK_CARD_CLASS}::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 3px;
+      background: var(--xvdl-accent);
+    }
+    .xvdl-task-head {
+      display: grid;
+      grid-template-columns: 36px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 9px;
+    }
+    .xvdl-task-avatar {
+      width: 36px;
+      height: 36px;
+      border-radius: 999px;
+      object-fit: cover;
+      background: rgb(47, 51, 54);
+    }
+    .xvdl-task-avatar-fallback {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: rgb(231, 233, 234);
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .xvdl-task-author {
+      min-width: 0;
+      line-height: 1.2;
+    }
+    .xvdl-task-author-name {
+      display: block;
+      overflow: hidden;
+      color: rgb(231, 233, 234);
+      font-size: 14px;
+      font-weight: 700;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .xvdl-task-author-handle {
+      display: block;
+      overflow: hidden;
+      margin-top: 2px;
+      color: rgb(113, 118, 123);
+      font-size: 12px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .xvdl-task-close,
+    .xvdl-task-action {
+      appearance: none;
+      border: 0;
+      color: inherit;
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+    }
+    .xvdl-task-close {
+      width: 30px;
+      height: 30px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: rgb(139, 152, 165);
+      transition: color 160ms ease, background-color 160ms ease, transform 160ms ease;
+    }
+    .xvdl-task-close:hover {
+      color: rgb(231, 233, 234);
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .xvdl-task-close:active,
+    .xvdl-task-action:active { transform: scale(0.97); }
+    .xvdl-task-close svg,
+    .xvdl-task-action svg {
+      width: 16px;
+      height: 16px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      pointer-events: none;
+    }
+    .xvdl-task-post {
+      appearance: none;
+      display: -webkit-box;
+      width: 100%;
+      overflow: hidden;
+      border: 0;
+      padding: 0;
+      margin: 11px 0 10px;
+      color: rgb(231, 233, 234);
+      background: transparent;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 13px;
+      line-height: 1.42;
+      text-align: left;
+      white-space: pre-wrap;
+      word-break: break-word;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 4;
+    }
+    .xvdl-task-post[data-expanded="true"] {
+      display: block;
+      overflow: visible;
+      -webkit-line-clamp: unset;
+    }
+    .xvdl-task-post:focus-visible {
+      outline: 2px solid rgba(29, 155, 240, 0.65);
+      outline-offset: 3px;
+      border-radius: 3px;
+    }
+    .xvdl-task-status {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 28px;
+      padding-top: 9px;
+      border-top: 1px solid rgba(255, 255, 255, 0.09);
+      color: rgb(139, 152, 165);
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .xvdl-task-status[hidden] { display: none; }
+    .xvdl-task-status[hidden] + .xvdl-task-actions { margin-top: 0; }
+    .xvdl-task-status-dot {
+      width: 7px;
+      height: 7px;
+      flex: 0 0 auto;
+      border-radius: 999px;
+      background: var(--xvdl-accent);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--xvdl-accent) 18%, transparent);
+    }
+    .${TASK_CARD_CLASS}[data-kind="work"] .xvdl-task-status-dot {
+      animation: xvdl-task-pulse 1.5s ease-in-out infinite;
+    }
+    .xvdl-task-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 9px;
+    }
+    .xvdl-task-actions[hidden] { display: none; }
+    .xvdl-task-action {
+      min-height: 30px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 999px;
+      padding: 0 10px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      color: rgb(231, 233, 234);
+      background: rgba(255, 255, 255, 0.055);
+      font-size: 12px;
+      font-weight: 650;
+      transition: border-color 160ms ease, background-color 160ms ease, transform 160ms ease;
+    }
+    .xvdl-task-action:hover {
+      border-color: rgba(29, 155, 240, 0.55);
+      background: rgba(29, 155, 240, 0.13);
+    }
+    .xvdl-task-action[data-task-action="copy"] {
+      border-color: rgba(0, 186, 124, 0.32);
+      color: rgb(125, 222, 183);
+    }
+    .xvdl-task-action:focus-visible,
+    .xvdl-task-close:focus-visible {
+      outline: 2px solid rgba(29, 155, 240, 0.65);
+      outline-offset: 2px;
+    }
+    @keyframes xvdl-task-enter {
+      from { opacity: 0; transform: translate3d(18px, 0, 0) scale(0.985); }
+      to { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+    }
+    @keyframes xvdl-task-pulse {
+      0%, 100% { opacity: 0.55; transform: scale(0.9); }
+      50% { opacity: 1; transform: scale(1.12); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .${TASK_CARD_CLASS},
+      .${TASK_CARD_CLASS}[data-kind="work"] .xvdl-task-status-dot { animation: none; }
+    }
+    @media (max-width: 720px) {
+      .${TASK_STACK_CLASS} {
+        top: 10px;
+        right: 10px;
+        width: calc(100vw - 20px);
+        max-height: calc(100dvh - 20px);
+      }
     }
     .${TOAST_CLASS} {
       position: fixed;
@@ -285,6 +530,7 @@ function applyMetaToButton(button, meta, adapterId = "") {
   button.dataset.tweetText = meta.tweetText || "";
   button.dataset.authorName = meta.authorName || "";
   button.dataset.authorHandle = meta.authorHandle || "";
+  button.dataset.avatarUrl = meta.avatarUrl || "";
   button.dataset.platform = meta.platform || "";
   button.dataset.mediaUrl = meta.mediaUrl || "";
   button.dataset.fileId = meta.fileId || "";
@@ -319,6 +565,7 @@ function wireClickHandler() {
       tweetText: meta.tweetText || button.dataset.tweetText || "",
       authorName: meta.authorName || button.dataset.authorName || "",
       authorHandle: meta.authorHandle || button.dataset.authorHandle || "",
+      avatarUrl: meta.avatarUrl || button.dataset.avatarUrl || "",
       platform: meta.platform || button.dataset.platform || "",
       mediaUrl: meta.mediaUrl || button.dataset.mediaUrl || "",
       fileId: meta.fileId || button.dataset.fileId || ""
@@ -336,6 +583,7 @@ function wireClickHandler() {
       tweetText: payload.tweetText,
       authorName: payload.authorName,
       authorHandle: payload.authorHandle,
+      avatarUrl: payload.avatarUrl,
       platform: payload.platform,
       mediaUrl: payload.mediaUrl,
       fileId: payload.fileId
@@ -343,7 +591,7 @@ function wireClickHandler() {
 
     setState(button, action, "loading");
     if (action === "transcript") {
-      showProgressToast("downloading");
+      upsertTranscriptTask(payload, "downloading");
     }
     sendRuntimeMessage(payload)
       .then(async (response) => {
@@ -352,37 +600,37 @@ function wireClickHandler() {
           const code = response?.code ? ` [${response.code}]` : "";
           const msg = `Failed${code}: ${response?.error || "unknown error"}\nLog: ~/Library/Logs/xvdl-native-host.log`;
           button.title = msg;
-          showToast(msg, "error");
+          if (action === "transcript") {
+            failTranscriptTask(itemId, msg);
+          } else {
+            showToast(msg, "error");
+          }
           resetLater(button, action);
           return;
         }
 
         setState(button, action, "done");
         if (action === "transcript") {
+          completeTranscriptTask(itemId, response.text || "", response.cached === true);
           if (response.cached) {
             try {
               await copyTextToClipboard(response.text || "");
               button.title = "Cached transcript copied to clipboard";
-              showToast(
-                `Verified saved transcript copied. Kept for ${formatRemainingDuration(response.cacheTtlSec)}.`,
-                "success"
-              );
+              setTranscriptTaskFeedback(itemId, "Transcript ready");
             } catch (error) {
-              setState(button, action, "error");
               const msg = `Transcript is cached, but clipboard copy failed: ${error instanceof Error ? error.message : String(error)}`;
               button.title = msg;
-              showToast(msg, "error");
+              setTranscriptTaskFeedback(itemId, "Ready · use Copy transcript to try again", 0, "error");
             }
           } else {
             try {
               await copyTextToClipboard(response.text || "");
               button.title = "Transcript copied to clipboard";
-              showToast("Full transcript verified, saved, and copied to clipboard", "success");
+              setTranscriptTaskFeedback(itemId, "Ready · copied to clipboard");
             } catch (error) {
-              setState(button, action, "error");
               const msg = `Transcript is saved, but clipboard copy failed: ${error instanceof Error ? error.message : String(error)}`;
               button.title = msg;
-              showToast(msg, "error");
+              setTranscriptTaskFeedback(itemId, "Ready · use Copy transcript to try again", 0, "error");
             }
           }
         } else {
@@ -395,7 +643,11 @@ function wireClickHandler() {
         setState(button, action, "error");
         const msg = `Failed: ${error instanceof Error ? error.message : String(error)}`;
         button.title = msg;
-        showToast(msg, "error");
+        if (action === "transcript") {
+          failTranscriptTask(itemId, msg);
+        } else {
+          showToast(msg, "error");
+        }
         resetLater(button, action);
       });
   });
@@ -466,7 +718,7 @@ function runDebug(button, action) {
 function wireRuntimeHandler() {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "XVDL_PROGRESS") {
-      showProgressToast(message.stage, message);
+      updateTranscriptTaskProgress(message.itemId, message.stage, message);
       return;
     }
 
@@ -483,6 +735,7 @@ function wireRuntimeHandler() {
       tweetText: meta?.tweetText || "",
       authorName: meta?.authorName || "",
       authorHandle: meta?.authorHandle || "",
+      avatarUrl: meta?.avatarUrl || "",
       platform: meta?.platform || "",
       mediaUrl: meta?.mediaUrl || "",
       fileId: meta?.fileId || ""
@@ -504,6 +757,7 @@ function getVisibleVideoContext() {
     tweetText: "",
     authorName: "",
     authorHandle: "",
+    avatarUrl: "",
     platform: "",
     mediaUrl: "",
     fileId: ""
@@ -543,20 +797,6 @@ function getButtonTitle(action) {
   return action === "transcript" ? "Transcribe and copy" : "Download video";
 }
 
-function formatRemainingDuration(seconds) {
-  const value = Math.max(0, Number(seconds || 0));
-  if (value >= 24 * 60 * 60) {
-    const days = Math.max(1, Math.ceil(value / (24 * 60 * 60)));
-    return `~${days} ${days === 1 ? "day" : "days"}`;
-  }
-  if (value >= 60 * 60) {
-    const hours = Math.max(1, Math.ceil(value / (60 * 60)));
-    return `~${hours} ${hours === 1 ? "hour" : "hours"}`;
-  }
-  const minutes = Math.max(1, Math.ceil(value / 60));
-  return `~${minutes} min`;
-}
-
 function resetLater(button, action) {
   window.setTimeout(() => {
     setState(button, action, "idle");
@@ -564,34 +804,372 @@ function resetLater(button, action) {
   }, 2400);
 }
 
-function showProgressToast(stage, details = {}) {
-  const toast = PROGRESS_TOASTS[String(stage || "")];
-  if (!toast) {
+function wireTaskPanelHandler() {
+  document.addEventListener("click", (event) => {
+    const target = event.target instanceof Element
+      ? event.target.closest("[data-task-action][data-task-id]")
+      : null;
+    if (!target) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    handleTaskPanelAction(target.dataset.taskId || "", target.dataset.taskAction || "");
+  });
+}
+
+function upsertTranscriptTask(meta, stage = "queued") {
+  const itemId = String(meta?.itemId || "");
+  if (!itemId) {
+    return null;
+  }
+
+  let task = transcriptTasks.get(itemId);
+  if (!task) {
+    task = {
+      itemId,
+      meta: { ...meta },
+      text: "",
+      status: "",
+      kind: "queued",
+      done: false,
+      expanded: false,
+      feedbackTimer: null,
+      card: null
+    };
+    transcriptTasks.set(itemId, task);
+  } else {
+    task.meta = { ...task.meta, ...meta };
+    task.text = "";
+    task.done = false;
+    window.clearTimeout(task.feedbackTimer);
+  }
+
+  applyTranscriptTaskStage(task, stage);
+  renderTranscriptTask(task);
+  return task;
+}
+
+function updateTranscriptTaskProgress(itemId, stage, details = {}) {
+  const task = transcriptTasks.get(String(itemId || ""));
+  if (!task) {
     return;
   }
+
+  applyTranscriptTaskStage(task, stage, details);
+  renderTranscriptTask(task);
+}
+
+function applyTranscriptTaskStage(task, stage, details = {}) {
+  const stageInfo = TRANSCRIPT_STAGES[String(stage || "")] || TRANSCRIPT_STAGES.queued;
   const attempt = Number(details.attempt || 0);
   const maxAttempts = Number(details.maxAttempts || 0);
   const suffix = attempt > 1 && maxAttempts > 1 ? ` (${attempt}/${maxAttempts})` : "";
-  const text = `${toast.text}${suffix}`;
+  task.status = `${stageInfo.text}${suffix}`;
+  task.kind = stageInfo.kind;
+}
 
-  if (stage === "transcribing") {
-    window.clearTimeout(progressTransitionTimer);
-    progressTransitionTimer = window.setTimeout(() => {
-      progressTransitionTimer = null;
-      showToast(text, toast.kind, PROGRESS_TOAST_DURATION_MS);
-    }, 700);
+function completeTranscriptTask(itemId, text, cached) {
+  const task = transcriptTasks.get(String(itemId || ""));
+  if (!task) {
     return;
   }
 
-  showToast(text, toast.kind, PROGRESS_TOAST_DURATION_MS);
+  task.text = String(text || "");
+  task.status = cached ? "Saved transcript ready" : "Transcript ready";
+  task.kind = "done";
+  task.done = true;
+  renderTranscriptTask(task);
+}
+
+function failTranscriptTask(itemId, message) {
+  const task = transcriptTasks.get(String(itemId || ""));
+  if (!task) {
+    return;
+  }
+
+  task.status = String(message || "Transcription failed").replace(/^Failed(?: \[[^\]]+\])?:\s*/i, "");
+  task.kind = "error";
+  task.done = false;
+  renderTranscriptTask(task);
+}
+
+function setTranscriptTaskFeedback(itemId, text, restoreAfterMs = 0, kind = "done") {
+  const task = transcriptTasks.get(String(itemId || ""));
+  if (!task) {
+    return;
+  }
+
+  window.clearTimeout(task.feedbackTimer);
+  task.status = String(text || "");
+  task.kind = kind;
+  renderTranscriptTask(task);
+
+  if (restoreAfterMs > 0) {
+    task.feedbackTimer = window.setTimeout(() => {
+      if (!transcriptTasks.has(task.itemId)) {
+        return;
+      }
+      task.status = "Transcript ready";
+      task.kind = "done";
+      renderTranscriptTask(task);
+    }, restoreAfterMs);
+  }
+}
+
+function renderTranscriptTask(task) {
+  const stack = ensureTaskStack();
+  if (!task.card) {
+    task.card = createTranscriptTaskCard(task.itemId);
+    stack.appendChild(task.card);
+  }
+
+  const ui = task.card._xvdlTaskUi;
+  task.card.dataset.kind = task.kind;
+  ui.authorName.textContent = task.meta.authorName || getTaskFallbackTitle(task.meta);
+  ui.authorHandle.textContent = task.meta.authorHandle || getTaskFallbackHandle(task.meta);
+  ui.post.textContent = task.meta.tweetText || task.meta.title || "Video transcript";
+  ui.post.dataset.expanded = String(task.expanded === true);
+  ui.post.setAttribute("aria-expanded", String(task.expanded === true));
+  const postActionLabel = task.expanded ? "Collapse post text" : "Expand full post text";
+  ui.post.title = postActionLabel;
+  ui.post.setAttribute("aria-label", postActionLabel);
+  ui.statusText.textContent = task.status;
+  ui.status.hidden = task.done && task.kind === "done";
+  syncTaskAvatar(ui.avatarSlot, task.meta);
+  renderTaskActions(ui.actions, task);
+}
+
+function ensureTaskStack() {
+  let stack = document.querySelector(`.${TASK_STACK_CLASS}`);
+  if (stack) {
+    return stack;
+  }
+
+  stack = document.createElement("aside");
+  stack.className = TASK_STACK_CLASS;
+  stack.setAttribute("aria-label", "Transcription tasks");
+  stack.setAttribute("aria-live", "polite");
+  document.documentElement.appendChild(stack);
+  return stack;
+}
+
+function createTranscriptTaskCard(itemId) {
+  const card = document.createElement("section");
+  card.className = TASK_CARD_CLASS;
+  card.dataset.taskId = itemId;
+
+  const head = document.createElement("div");
+  head.className = "xvdl-task-head";
+
+  const avatarSlot = document.createElement("div");
+  const author = document.createElement("div");
+  author.className = "xvdl-task-author";
+  const authorName = document.createElement("span");
+  authorName.className = "xvdl-task-author-name";
+  const authorHandle = document.createElement("span");
+  authorHandle.className = "xvdl-task-author-handle";
+  author.append(authorName, authorHandle);
+
+  const close = createTaskButton(itemId, "close", "Close task", renderTaskActionIcon("close"));
+  close.className = "xvdl-task-close";
+  head.append(avatarSlot, author, close);
+
+  const post = document.createElement("button");
+  post.type = "button";
+  post.className = "xvdl-task-post";
+  post.dataset.taskId = itemId;
+  post.dataset.taskAction = "toggle-post";
+  post.setAttribute("aria-label", "Expand full post text");
+
+  const status = document.createElement("div");
+  status.className = "xvdl-task-status";
+  const statusDot = document.createElement("span");
+  statusDot.className = "xvdl-task-status-dot";
+  statusDot.setAttribute("aria-hidden", "true");
+  const statusText = document.createElement("span");
+  status.append(statusDot, statusText);
+
+  const actions = document.createElement("div");
+  actions.className = "xvdl-task-actions";
+  card.append(head, post, status, actions);
+  card._xvdlTaskUi = { avatarSlot, authorName, authorHandle, post, status, statusText, actions };
+  return card;
+}
+
+function syncTaskAvatar(slot, meta) {
+  const safeUrl = getSafeImageUrl(meta?.avatarUrl);
+  const current = slot.firstElementChild;
+  if (safeUrl && current instanceof HTMLImageElement && current.src === safeUrl) {
+    return;
+  }
+
+  slot.replaceChildren();
+  if (safeUrl) {
+    const image = document.createElement("img");
+    image.className = "xvdl-task-avatar";
+    image.src = safeUrl;
+    image.alt = "";
+    image.referrerPolicy = "no-referrer";
+    image.addEventListener("error", () => {
+      if (image.isConnected) {
+        slot.replaceChildren(createTaskAvatarFallback(meta));
+      }
+    }, { once: true });
+    slot.appendChild(image);
+    return;
+  }
+
+  slot.appendChild(createTaskAvatarFallback(meta));
+}
+
+function createTaskAvatarFallback(meta) {
+  const fallback = document.createElement("span");
+  fallback.className = "xvdl-task-avatar xvdl-task-avatar-fallback";
+  const source = String(meta?.authorName || meta?.authorHandle || meta?.platform || "V").replace(/^@/, "");
+  fallback.textContent = source.trim().charAt(0).toUpperCase() || "V";
+  fallback.setAttribute("aria-hidden", "true");
+  return fallback;
+}
+
+function getSafeImageUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function getTaskFallbackTitle(meta) {
+  return meta?.platform === "gdrive" ? "Google Drive" : "X post";
+}
+
+function getTaskFallbackHandle(meta) {
+  return meta?.platform === "gdrive" ? "Video transcript" : "@x";
+}
+
+function renderTaskActions(container, task) {
+  const buttons = [];
+  if (task.done) {
+    buttons.push(createTaskButton(task.itemId, "copy", "Copy transcript", renderTaskActionIcon("copy"), "Copy"));
+    buttons.push(createTaskButton(task.itemId, "download", "Download transcript", renderTaskActionIcon("download"), "Download"));
+  }
+  if (task.meta.itemUrl) {
+    buttons.push(createTaskButton(task.itemId, "open", "Open original post", renderTaskActionIcon("open"), "Open post"));
+  }
+  container.replaceChildren(...buttons);
+  container.hidden = buttons.length === 0;
+}
+
+function createTaskButton(itemId, action, title, icon, label = "") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "xvdl-task-action";
+  button.dataset.taskId = itemId;
+  button.dataset.taskAction = action;
+  button.title = title;
+  button.setAttribute("aria-label", title);
+  button.innerHTML = icon;
+  if (label) {
+    const text = document.createElement("span");
+    text.textContent = label;
+    button.appendChild(text);
+  }
+  return button;
+}
+
+function renderTaskActionIcon(action) {
+  if (action === "copy") {
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>';
+  }
+  if (action === "download") {
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11"></path><path d="m7 10 5 5 5-5"></path><path d="M5 20h14"></path></svg>';
+  }
+  if (action === "open") {
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5"></path><path d="m19 5-9 9"></path><path d="M19 14v4a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h4"></path></svg>';
+  }
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"></path></svg>';
+}
+
+async function handleTaskPanelAction(itemId, action) {
+  const task = transcriptTasks.get(String(itemId || ""));
+  if (!task) {
+    return;
+  }
+
+  if (action === "toggle-post") {
+    task.expanded = !task.expanded;
+    renderTranscriptTask(task);
+    return;
+  }
+
+  if (action === "close") {
+    window.clearTimeout(task.feedbackTimer);
+    task.card?.remove();
+    transcriptTasks.delete(task.itemId);
+    const stack = document.querySelector(`.${TASK_STACK_CLASS}`);
+    if (stack && !transcriptTasks.size) {
+      stack.remove();
+    }
+    return;
+  }
+
+  if (action === "open") {
+    window.open(task.meta.itemUrl, "_blank", "noopener,noreferrer");
+    return;
+  }
+
+  if (!task.done) {
+    return;
+  }
+
+  try {
+    if (action === "copy") {
+      const text = task.text || await fetchTranscriptTaskText(task);
+      await copyTextToClipboard(text);
+      task.text = text;
+      setTranscriptTaskFeedback(task.itemId, "Copied to clipboard", 1800);
+      return;
+    }
+
+    if (action === "download") {
+      const response = await sendRuntimeMessage({
+        type: "DOWNLOAD_ITEM_TRANSCRIPT",
+        itemId: task.itemId,
+        itemUrl: task.meta.itemUrl || "",
+        title: task.meta.title || "",
+        tweetText: task.meta.tweetText || "",
+        authorName: task.meta.authorName || "",
+        authorHandle: task.meta.authorHandle || "",
+        platform: task.meta.platform || ""
+      });
+      if (!response?.ok) {
+        throw new Error(response?.error || "Could not download transcript.");
+      }
+      setTranscriptTaskFeedback(task.itemId, "Transcript download started", 1800);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setTranscriptTaskFeedback(task.itemId, message || "Action failed", 2600, "error");
+  }
+}
+
+async function fetchTranscriptTaskText(task) {
+  const response = await sendRuntimeMessage({
+    type: "GET_TRANSCRIPT_FOR_ITEM",
+    itemId: task.itemId,
+    itemUrl: task.meta.itemUrl || "",
+    platform: task.meta.platform || ""
+  });
+  if (!response?.ok || !response.text) {
+    throw new Error(response?.error || "Saved transcript is unavailable.");
+  }
+  return String(response.text);
 }
 
 function showToast(text, kind = "error", durationMs = 6000) {
-  if (progressTransitionTimer !== null) {
-    window.clearTimeout(progressTransitionTimer);
-    progressTransitionTimer = null;
-  }
-
   const existing = document.querySelector(`.${TOAST_CLASS}`);
   if (existing) {
     existing.remove();

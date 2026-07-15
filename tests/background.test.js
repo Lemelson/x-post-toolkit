@@ -443,8 +443,8 @@ test("builds X transcript output with author and full tweet text", () => {
     buildTranscriptOutput(entry, { includeTitle: true, timestampMode: "off" }),
     [
       "Tweet author: TBPN (@tbpn)",
-      "Above is tweet text:\n@naval said this thing like, 'It's really hard.'\n\n@alexhormozi on his advice for young people:",
-      "Below is video transcript:\nVideo transcript."
+      "Tweet text:\n@naval said this thing like, 'It's really hard.'\n\n@alexhormozi on his advice for young people:",
+      "Video transcript:\nVideo transcript."
     ].join("\n\n")
   );
 });
