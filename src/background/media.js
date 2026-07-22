@@ -3,6 +3,7 @@
 import { buildDriveDownloadUrl, normalizeMediaUrl } from "./context.js";
 
 export const MEDIA_FETCH_TIMEOUT_MS = 20 * 1000;
+export const TRANSCRIPT_AUDIO_PROBE_TIMEOUT_MS = 2500;
 
 export async function resolveBestMedia(context, purpose) {
   const candidates = await resolveMediaCandidates(context, purpose);
@@ -110,7 +111,11 @@ export async function getFromSyndication(tweetId, options = {}) {
   const purpose = options.purpose === "transcript" ? "transcript" : "download";
   let audioInfo = null;
   if (purpose === "transcript") {
-    audioInfo = await resolveBestAudioCandidate(payload, options.timeoutMs);
+    const audioProbeTimeoutMs = Math.min(
+      sanitizeTimeout(options.audioProbeTimeoutMs, TRANSCRIPT_AUDIO_PROBE_TIMEOUT_MS),
+      sanitizeTimeout(options.timeoutMs, MEDIA_FETCH_TIMEOUT_MS)
+    );
+    audioInfo = await resolveBestAudioCandidate(payload, audioProbeTimeoutMs);
     for (const variant of variants) {
       variant.audioBitrate = audioInfo?.audioBitrates.get(extractVariantResolution(variant.url)) || 0;
     }

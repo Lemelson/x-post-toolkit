@@ -51,6 +51,19 @@ class NativeHostUrlValidationTest(unittest.TestCase):
       "downloadElapsedMs": 1250,
     })
 
+  def test_spokenly_slot_serializes_asr_across_native_host_processes(self):
+    with mock.patch.object(native_host.fcntl, "flock") as flock:
+      with native_host.spokenly_slot():
+        pass
+
+    self.assertEqual(
+      flock.call_args_list,
+      [
+        mock.call(mock.ANY, native_host.fcntl.LOCK_EX),
+        mock.call(mock.ANY, native_host.fcntl.LOCK_UN),
+      ],
+    )
+
   def test_rejects_truncated_audio_and_transcript_coverage(self):
     self.assertTrue(native_host.is_audio_duration_complete(1081466, 1081514))
     self.assertFalse(native_host.is_audio_duration_complete(1081466, 65000))
@@ -84,10 +97,18 @@ class NativeHostUrlValidationTest(unittest.TestCase):
 
     stages = [call.args[1] for call in send_progress.call_args_list]
     command_stages = [call.kwargs["stage"] for call in run_cmd.call_args_list]
+    downloading = next(call for call in send_progress.call_args_list if call.args[1] == "downloading")
+    transcribing = next(call for call in send_progress.call_args_list if call.args[1] == "transcribing")
     self.assertEqual(command_stages, ["ffmpeg", "ffmpeg"])
     self.assertIn("retrying-download", stages)
     self.assertIn("retrying-transcription", stages)
+    self.assertLess(stages.index("downloaded"), stages.index("waiting-transcription"))
+    self.assertLess(stages.index("waiting-transcription"), stages.index("transcribing"))
+    self.assertEqual(downloading.kwargs["expectedDurationMs"], 1081466)
+    self.assertEqual(transcribing.kwargs["audioDurationMs"], 1081514)
+    self.assertGreaterEqual(transcribing.kwargs["queueElapsedMs"], 0)
     self.assertTrue(result["complete"])
+    self.assertGreaterEqual(result["queueElapsedMs"], 0)
     self.assertEqual(result["audioDurationMs"], 1081514)
     self.assertEqual(result["transcriptEndMs"], 1079520)
     self.assertEqual(len(result["sentences"]), 1)

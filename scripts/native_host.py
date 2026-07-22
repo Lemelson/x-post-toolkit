@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import ipaddress
@@ -13,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import wave
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
@@ -28,6 +30,10 @@ FFMPEG_RW_TIMEOUT_US = int(os.environ.get("XVDL_FFMPEG_RW_TIMEOUT_US", "30000000
 DOWNLOAD_ATTEMPTS = max(1, int(os.environ.get("XVDL_DOWNLOAD_ATTEMPTS", "3")))
 ASR_ATTEMPTS = max(1, int(os.environ.get("XVDL_ASR_ATTEMPTS", "2")))
 LOG_PATH = os.path.expanduser("~/Library/Logs/xvdl-native-host.log")
+SPOKENLY_LOCK_PATH = os.path.join(tempfile.gettempdir(), "xvdl-spokenly-asr.lock")
+# TODO(PRODUCTION): Remove the temporary [DEBUG-XVDL-PERF] probes before the
+# extension is shipped to production.
+PERF_LOG_PREFIX = "[DEBUG-XVDL-PERF]"
 MAX_MEDIA_URL_LENGTH = 8192
 ALLOWED_MEDIA_HOSTS = {
   "video.twimg.com",
@@ -85,9 +91,12 @@ class SpokenlyResponseError(Exception):
 
 def log_line(message: str) -> None:
   try:
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+    stamp = f"{stamp}.{int((now % 1) * 1000):03d}"
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     with open(LOG_PATH, "a", encoding="utf-8") as f:
-      f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+      f.write(f"{stamp} {message}\n")
   except Exception:
     return
 
@@ -111,9 +120,18 @@ def resolve_executable(name_or_path: str, extra_candidates: list[str]) -> str:
 
 
 def send_message(payload: dict[str, Any]) -> None:
+  serialize_started = time.monotonic()
   raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+  serialize_elapsed_ms = int((time.monotonic() - serialize_started) * 1000)
   header = struct.pack("<I", len(raw))
+  write_started = time.monotonic()
   write_all(1, header + raw)
+  write_elapsed_ms = int((time.monotonic() - write_started) * 1000)
+  if payload.get("type") == "result":
+    log_line(
+      f"{PERF_LOG_PREFIX} native response written item_id={payload.get('itemId', '')} "
+      f"bytes={len(raw)} serialize_ms={serialize_elapsed_ms} write_ms={write_elapsed_ms}"
+    )
 
 
 def write_all(fd: int, data: bytes) -> None:
@@ -412,6 +430,16 @@ def send_progress(item_id: str, stage: str, **details: Any) -> None:
   })
 
 
+@contextmanager
+def spokenly_slot():
+  with open(SPOKENLY_LOCK_PATH, "a", encoding="utf-8") as lock_file:
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    try:
+      yield
+    finally:
+      fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def transcribe(
   item_id: str,
   mp4_url: str,
@@ -448,6 +476,7 @@ def transcribe(
           "downloading",
           attempt=attempt,
           maxAttempts=DOWNLOAD_ATTEMPTS,
+          expectedDurationMs=expected_duration_ms,
         )
       try:
         Path(audio_path).unlink(missing_ok=True)
@@ -497,6 +526,7 @@ def transcribe(
             "retrying-download",
             attempt=attempt + 1,
             maxAttempts=DOWNLOAD_ATTEMPTS,
+            expectedDurationMs=expected_duration_ms,
             error=str(error),
           )
         time.sleep(min(attempt, 2))
@@ -514,47 +544,81 @@ def transcribe(
         audioDurationMs=audio_duration_ms,
       )
 
-    asr_started = time.time()
     transcript = ""
     transcript_end_ms = 0
     sentences: list[dict[str, Any]] = []
-    for attempt in range(1, ASR_ATTEMPTS + 1):
-      if emit_progress:
-        send_progress(
-          item_id,
-          "transcribing",
-          attempt=attempt,
-          maxAttempts=ASR_ATTEMPTS,
-          downloadElapsedMs=download_elapsed_ms,
-        )
-      try:
-        transcript, transcript_end_ms, sentences = call_spokenly(audio_path)
-        if not is_transcript_coverage_complete(audio_duration_ms, transcript_end_ms, len(transcript)):
-          raise IncompleteTranscriptError(audio_duration_ms, transcript_end_ms)
-        break
-      except (
-        CommandTimeout,
-        IncompleteTranscriptError,
-        SpokenlyResponseError,
-        SpokenlyUnavailableError,
-      ) as error:
-        log_line(
-          f"asr attempt failed item_id={item_id} attempt={attempt}/{ASR_ATTEMPTS} "
-          f"error={error}"
-        )
-        if isinstance(error, CommandTimeout):
-          raise
-        if attempt >= ASR_ATTEMPTS:
-          raise
+    if emit_progress:
+      send_progress(
+        item_id,
+        "waiting-transcription",
+        audioDurationMs=audio_duration_ms,
+      )
+
+    slot_wait_started = time.monotonic()
+    with spokenly_slot():
+      queue_elapsed_ms = int((time.monotonic() - slot_wait_started) * 1000)
+      log_line(
+        f"{PERF_LOG_PREFIX} spokenly slot acquired item_id={item_id} "
+        f"queue_ms={queue_elapsed_ms}"
+      )
+      asr_started = time.time()
+      for attempt in range(1, ASR_ATTEMPTS + 1):
         if emit_progress:
           send_progress(
             item_id,
-            "retrying-transcription",
-            attempt=attempt + 1,
+            "transcribing",
+            attempt=attempt,
             maxAttempts=ASR_ATTEMPTS,
-            error=str(error),
+            downloadElapsedMs=download_elapsed_ms,
+            queueElapsedMs=queue_elapsed_ms,
+            audioDurationMs=audio_duration_ms,
           )
-        time.sleep(min(attempt, 2))
+        attempt_started = time.monotonic()
+        log_line(
+          f"{PERF_LOG_PREFIX} spokenly request started item_id={item_id} "
+          f"attempt={attempt}/{ASR_ATTEMPTS} audio_ms={audio_duration_ms}"
+        )
+        try:
+          transcript, transcript_end_ms, sentences = call_spokenly(audio_path)
+          request_elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
+          log_line(
+            f"{PERF_LOG_PREFIX} spokenly request finished item_id={item_id} "
+            f"attempt={attempt}/{ASR_ATTEMPTS} request_ms={request_elapsed_ms} "
+            f"chars={len(transcript)} transcript_end_ms={transcript_end_ms}"
+          )
+          if not is_transcript_coverage_complete(audio_duration_ms, transcript_end_ms, len(transcript)):
+            raise IncompleteTranscriptError(audio_duration_ms, transcript_end_ms)
+          break
+        except (
+          CommandTimeout,
+          IncompleteTranscriptError,
+          SpokenlyResponseError,
+          SpokenlyUnavailableError,
+        ) as error:
+          request_elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
+          log_line(
+            f"{PERF_LOG_PREFIX} spokenly request failed item_id={item_id} "
+            f"attempt={attempt}/{ASR_ATTEMPTS} request_ms={request_elapsed_ms} "
+            f"error_type={type(error).__name__}"
+          )
+          log_line(
+            f"asr attempt failed item_id={item_id} attempt={attempt}/{ASR_ATTEMPTS} "
+            f"error={error}"
+          )
+          if isinstance(error, CommandTimeout):
+            raise
+          if attempt >= ASR_ATTEMPTS:
+            raise
+          if emit_progress:
+            send_progress(
+              item_id,
+              "retrying-transcription",
+              attempt=attempt + 1,
+              maxAttempts=ASR_ATTEMPTS,
+              audioDurationMs=audio_duration_ms,
+              error=str(error),
+            )
+          time.sleep(min(attempt, 2))
 
     asr_elapsed_ms = int((time.time() - asr_started) * 1000)
     log_line(
@@ -577,6 +641,7 @@ def transcribe(
     "charCount": len(transcript),
     "elapsedMs": elapsed_ms,
     "downloadElapsedMs": download_elapsed_ms,
+    "queueElapsedMs": queue_elapsed_ms,
     "asrElapsedMs": asr_elapsed_ms,
     "validationVersion": 1,
     "expectedDurationMs": expected_duration_ms,

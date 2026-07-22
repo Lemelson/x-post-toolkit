@@ -14,6 +14,21 @@ import {
   buildTranscriptOutput
 } from "../src/background/format.js";
 import {
+  PERF_LOG_KEY,
+  addTraceToLog,
+  createPerfTrace,
+  markPerfTrace,
+  sanitizePerfDetails
+} from "../src/background/diagnostics.js";
+import {
+  ETA_MAX_SAMPLES,
+  addEtaSample,
+  estimateEtaMs,
+  isPhaseSlowdown,
+  robustMean
+} from "../src/background/eta.js";
+import {
+  TRANSCRIPT_AUDIO_PROBE_TIMEOUT_MS,
   collectAudioPlaylists,
   collectMp4Variants,
   compareTranscriptVariantPriority,
@@ -206,6 +221,51 @@ test("selects the lightest MP4 with full-quality audio and keeps HLS as fallback
   }
 });
 
+test("does not let the optional HLS audio probe hold up MP4 transcription", async () => {
+  const previousFetch = globalThis.fetch;
+  const masterUrl = "https://video.twimg.com/video/master.m3u8";
+  let fetchCount = 0;
+  globalThis.fetch = async (_url, init = {}) => {
+    fetchCount += 1;
+    if (fetchCount === 1) {
+      return {
+        ok: true,
+        async json() {
+          return {
+            mediaDetails: [{
+              video_info: {
+                duration_millis: 60000,
+                variants: [
+                  { content_type: "application/x-mpegURL", url: masterUrl },
+                  { content_type: "video/mp4", url: "https://video.twimg.com/video/640x360/test.mp4", bitrate: 512000 }
+                ]
+              }
+            }]
+          };
+        }
+      };
+    }
+
+    return await new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+    });
+  };
+
+  try {
+    const started = Date.now();
+    const candidates = await getFromSyndication("12345678", {
+      purpose: "transcript",
+      timeoutMs: 200,
+      audioProbeTimeoutMs: 10
+    });
+    assert.equal(candidates[0].url, "https://video.twimg.com/video/640x360/test.mp4");
+    assert.ok(Date.now() - started < 100);
+    assert.ok(TRANSCRIPT_AUDIO_PROBE_TIMEOUT_MS < 20_000);
+  } finally {
+    restoreGlobal("fetch", previousFetch);
+  }
+});
+
 test("parses audio renditions and ranks transcript MP4 fallbacks by source then ascending bitrate", () => {
   const playlists = collectAudioPlaylists(
     [
@@ -355,14 +415,105 @@ test("sanitizes settings and filenames", () => {
     maxItems: 200,
     retentionHours: 1,
     includeTitle: true,
-    timestampMode: "off"
+    timestampMode: "off",
+    autoCloseMinutes: 5
   });
   assert.deepEqual(
-    sanitizeSettings({ includeTitle: false, timestampMode: "s30" }),
-    { maxItems: 10, retentionHours: 168, includeTitle: false, timestampMode: "s30" }
+    sanitizeSettings({ includeTitle: false, timestampMode: "s30", autoCloseMinutes: 90 }),
+    { maxItems: 10, retentionHours: 168, includeTitle: false, timestampMode: "s30", autoCloseMinutes: 90 }
   );
+  assert.equal(sanitizeSettings({ autoCloseMinutes: 0 }).autoCloseMinutes, 0);
+  assert.equal(sanitizeSettings({ autoCloseMinutes: 999999 }).autoCloseMinutes, 10080);
   assert.equal(sanitizeSettings({ timestampMode: "bogus" }).timestampMode, "off");
   assert.equal(sanitizeFilename('bad/name:*?"<>| title'), "bad name title");
+});
+
+test("estimates cold-start ETA from conservative phase defaults", () => {
+  const empty = { version: 1, samples: [] };
+  assert.equal(estimateEtaMs(empty, "download", 60000), 9000);
+  assert.equal(estimateEtaMs(empty, "transcription", 60000), 15000);
+});
+
+test("learns personal phase speed while trimming extreme samples", () => {
+  let stats = { version: 1, samples: [] };
+  for (let index = 0; index < 10; index += 1) {
+    const downloadElapsedMs = index === 0 ? 1000 : index === 9 ? 1000000 : 10000;
+    const asrElapsedMs = index === 0 ? 2000 : index === 9 ? 1200000 : 20000;
+    stats = addEtaSample(stats, {
+      durationMs: 100000,
+      downloadElapsedMs,
+      asrElapsedMs,
+      recordedAt: 1000 + index
+    });
+  }
+
+  assert.equal(estimateEtaMs(stats, "download", 100000), 10000);
+  assert.equal(estimateEtaMs(stats, "transcription", 100000), 20000);
+  assert.equal(robustMean([0.01, 0.1, 0.1, 0.1, 0.1, 1]), 0.1);
+});
+
+test("flags an ASR phase that exceeds the learned baseline by three times", () => {
+  const stats = {
+    version: 1,
+    samples: [1, 2, 3].map((recordedAt) => ({
+      durationMs: 60000,
+      downloadElapsedMs: 5000,
+      asrElapsedMs: 5000,
+      recordedAt
+    }))
+  };
+
+  assert.equal(isPhaseSlowdown(stats, "transcription", 60000, 14999), false);
+  assert.equal(isPhaseSlowdown(stats, "transcription", 60000, 15001), true);
+  assert.equal(isPhaseSlowdown(stats, "transcription", 60000, 5000), false);
+});
+
+test("keeps only the latest valid ETA samples", () => {
+  let stats = { version: 1, samples: [] };
+  for (let index = 0; index < ETA_MAX_SAMPLES + 5; index += 1) {
+    stats = addEtaSample(stats, {
+      durationMs: 60000,
+      downloadElapsedMs: 5000,
+      asrElapsedMs: 8000,
+      recordedAt: 1000 + index
+    });
+  }
+  const unchanged = addEtaSample(stats, {
+    durationMs: 1000,
+    downloadElapsedMs: 1,
+    asrElapsedMs: 1
+  });
+
+  assert.equal(stats.samples.length, ETA_MAX_SAMPLES);
+  assert.equal(stats.samples[0].recordedAt, 1005);
+  assert.deepEqual(unchanged, stats);
+});
+
+test("keeps temporary performance traces bounded and free of nested payloads", () => {
+  const trace = createPerfTrace("x:12345678", 1000);
+  markPerfTrace(trace, "native_finished", {
+    elapsedMs: 125357,
+    transcript: { mustNotBeStored: true },
+    preview: "x".repeat(300)
+  }, 126357);
+
+  let log = [];
+  for (let index = 0; index < 35; index += 1) {
+    log = addTraceToLog(log, {
+      ...trace,
+      traceId: `trace-${index}`,
+      itemId: `x:${index}`
+    });
+  }
+
+  assert.equal(PERF_LOG_KEY, "xvdlTemporaryPerfDiagnosticsV1");
+  assert.equal(log.length, 30);
+  assert.equal(log[0].traceId, "trace-34");
+  assert.deepEqual(trace.events[0].details, {
+    elapsedMs: 125357,
+    preview: "x".repeat(160)
+  });
+  assert.deepEqual(sanitizePerfDetails({ ok: true, list: [1, 2], missing: undefined }), { ok: true });
 });
 
 test("computes the syndication token from the tweet id", () => {

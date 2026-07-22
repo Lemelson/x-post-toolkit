@@ -21,7 +21,8 @@ export const DEFAULT_SETTINGS = {
   maxItems: 10,
   retentionHours: 24 * 7,
   includeTitle: true,
-  timestampMode: "off"
+  timestampMode: "off",
+  autoCloseMinutes: 5
 };
 export const TRANSCRIPT_VALIDATION_VERSION = 1;
 
@@ -79,7 +80,10 @@ export function sanitizeSettings(raw) {
   const retentionHours = clampInt(raw?.retentionHours, 1, 24 * 30, fallback.retentionHours);
   const includeTitle = raw?.includeTitle === undefined ? fallback.includeTitle : raw.includeTitle === true;
   const timestampMode = sanitizeTimestampMode(raw?.timestampMode);
-  return { maxItems, retentionHours, includeTitle, timestampMode };
+  const autoCloseMinutes = Number(raw?.autoCloseMinutes) === 0
+    ? 0
+    : clampInt(raw?.autoCloseMinutes, 1, 7 * 24 * 60, fallback.autoCloseMinutes);
+  return { maxItems, retentionHours, includeTitle, timestampMode, autoCloseMinutes };
 }
 
 export function clampInt(value, min, max, fallback) {
@@ -100,8 +104,9 @@ export async function getStore() {
 }
 
 export async function getPrunedStore(settingsOverride) {
-  const settings = settingsOverride || (await getSettings());
-  const store = await getStore();
+  const [settings, store] = settingsOverride
+    ? [settingsOverride, await getStore()]
+    : await Promise.all([getSettings(), getStore()]);
   const normalized = normalizeStore(store, settings);
 
   if (normalized.changed) {

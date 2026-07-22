@@ -16,12 +16,16 @@ const TRANSCRIPT_STAGES = {
   queued: { text: "Waiting in queue", kind: "queued" },
   downloading: { text: "Downloading audio…", kind: "work" },
   downloaded: { text: "Audio downloaded", kind: "step" },
+  "waiting-transcription": { text: "Audio ready — waiting for transcription", kind: "queued" },
   transcribing: { text: "Transcribing…", kind: "work" },
   "invalid-cache": { text: "Refreshing saved transcript…", kind: "step" },
   "retrying-download": { text: "Retrying audio download…", kind: "step" },
   "retrying-transcription": { text: "Retrying transcription…", kind: "step" }
 };
+const ETA_STAGES = new Set(["downloading", "transcribing"]);
 const transcriptTasks = new Map();
+let etaTickTimer = null;
+let autoCloseTickTimer = null;
 
 const adapterApi = {
   ACTIONS_CLASS,
@@ -218,7 +222,7 @@ function injectStyles() {
     }
     .xvdl-task-head {
       display: grid;
-      grid-template-columns: 36px minmax(0, 1fr) auto;
+      grid-template-columns: 36px minmax(0, 1fr) auto auto;
       align-items: center;
       gap: 9px;
     }
@@ -259,6 +263,25 @@ function injectStyles() {
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    .xvdl-task-auto-close {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: rgb(139, 152, 165);
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .xvdl-task-auto-close::before {
+      width: 6px;
+      height: 6px;
+      flex: 0 0 auto;
+      border-radius: 999px;
+      background: var(--xvdl-accent);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--xvdl-accent) 18%, transparent);
+      content: "";
+    }
+    .xvdl-task-auto-close[hidden] { display: none; }
     .xvdl-task-close,
     .xvdl-task-action {
       appearance: none;
@@ -376,9 +399,29 @@ function injectStyles() {
       border-color: rgba(29, 155, 240, 0.55);
       background: rgba(29, 155, 240, 0.13);
     }
+    .xvdl-task-action:disabled {
+      cursor: wait;
+    }
+    .xvdl-task-action:disabled:hover {
+      border-color: rgba(255, 255, 255, 0.12);
+      background: rgba(255, 255, 255, 0.055);
+    }
     .xvdl-task-action[data-task-action="copy"] {
       border-color: rgba(0, 186, 124, 0.32);
       color: rgb(125, 222, 183);
+    }
+    .xvdl-task-action[data-action-state="done"] {
+      border-color: rgba(0, 186, 124, 0.48);
+      color: rgb(125, 222, 183);
+      background: rgba(0, 186, 124, 0.12);
+    }
+    .xvdl-task-action[data-action-state="error"] {
+      border-color: rgba(244, 33, 46, 0.48);
+      color: rgb(255, 127, 136);
+      background: rgba(244, 33, 46, 0.1);
+    }
+    .xvdl-task-action[data-action-state="working"] svg {
+      animation: xvdl-task-spin 0.85s linear infinite;
     }
     .xvdl-task-action:focus-visible,
     .xvdl-task-close:focus-visible {
@@ -393,9 +436,13 @@ function injectStyles() {
       0%, 100% { opacity: 0.55; transform: scale(0.9); }
       50% { opacity: 1; transform: scale(1.12); }
     }
+    @keyframes xvdl-task-spin {
+      to { transform: rotate(360deg); }
+    }
     @media (prefers-reduced-motion: reduce) {
       .${TASK_CARD_CLASS},
-      .${TASK_CARD_CLASS}[data-kind="work"] .xvdl-task-status-dot { animation: none; }
+      .${TASK_CARD_CLASS}[data-kind="work"] .xvdl-task-status-dot,
+      .xvdl-task-action[data-action-state="working"] svg { animation: none; }
     }
     @media (max-width: 720px) {
       .${TASK_STACK_CLASS} {
@@ -540,6 +587,9 @@ function applyMetaToButton(button, meta, adapterId = "") {
 }
 
 function wireClickHandler() {
+  // X's modal player handles clicks inside its control bar and can stop them
+  // before they bubble to document. Capture our delegated actions first so
+  // the same buttons work in both the timeline and the player overlay.
   document.addEventListener("click", (event) => {
     const button = event.target instanceof Element ? event.target.closest(`.${BTN_CLASS}`) : null;
     if (!button || button.dataset.role !== BTN_ROLE) {
@@ -595,6 +645,10 @@ function wireClickHandler() {
     }
     sendRuntimeMessage(payload)
       .then(async (response) => {
+        recordTemporaryPerfEvent(response, itemId, "content_response_received", {
+          cached: response?.cached === true,
+          chars: Number(response?.chars || 0)
+        });
         if (!response?.ok) {
           setState(button, action, "error");
           const code = response?.code ? ` [${response.code}]` : "";
@@ -612,22 +666,36 @@ function wireClickHandler() {
         setState(button, action, "done");
         if (action === "transcript") {
           completeTranscriptTask(itemId, response.text || "", response.cached === true);
+          const slowAsrWarning = response.slowAsr
+            ? "Ready · Spokenly was unusually slow — restart it before the next transcript"
+            : "";
+          recordTemporaryPerfEvent(response, itemId, "content_task_completed");
           if (response.cached) {
             try {
+              recordTemporaryPerfEvent(response, itemId, "clipboard_copy_started");
               await copyTextToClipboard(response.text || "");
-              button.title = "Cached transcript copied to clipboard";
-              setTranscriptTaskFeedback(itemId, "Transcript ready");
+              recordTemporaryPerfEvent(response, itemId, "clipboard_copy_finished");
+              button.title = slowAsrWarning || "Cached transcript copied to clipboard";
+              setTranscriptTaskFeedback(itemId, slowAsrWarning || "Transcript ready", 0, slowAsrWarning ? "step" : "done");
             } catch (error) {
+              recordTemporaryPerfEvent(response, itemId, "clipboard_copy_failed", {
+                message: error instanceof Error ? error.message : String(error)
+              });
               const msg = `Transcript is cached, but clipboard copy failed: ${error instanceof Error ? error.message : String(error)}`;
               button.title = msg;
               setTranscriptTaskFeedback(itemId, "Ready · use Copy transcript to try again", 0, "error");
             }
           } else {
             try {
+              recordTemporaryPerfEvent(response, itemId, "clipboard_copy_started");
               await copyTextToClipboard(response.text || "");
-              button.title = "Transcript copied to clipboard";
-              setTranscriptTaskFeedback(itemId, "Ready · copied to clipboard");
+              recordTemporaryPerfEvent(response, itemId, "clipboard_copy_finished");
+              button.title = slowAsrWarning || "Transcript copied to clipboard";
+              setTranscriptTaskFeedback(itemId, slowAsrWarning || "Ready · copied to clipboard", 0, slowAsrWarning ? "step" : "done");
             } catch (error) {
+              recordTemporaryPerfEvent(response, itemId, "clipboard_copy_failed", {
+                message: error instanceof Error ? error.message : String(error)
+              });
               const msg = `Transcript is saved, but clipboard copy failed: ${error instanceof Error ? error.message : String(error)}`;
               button.title = msg;
               setTranscriptTaskFeedback(itemId, "Ready · use Copy transcript to try again", 0, "error");
@@ -650,7 +718,22 @@ function wireClickHandler() {
         }
         resetLater(button, action);
       });
-  });
+  }, true);
+}
+
+// TODO(PRODUCTION): Remove this temporary [DEBUG-XVDL-PERF] reporting path
+// together with src/background/diagnostics.js before production release.
+function recordTemporaryPerfEvent(response, itemId, event, details = {}) {
+  const traceId = String(response?.debugTraceId || "");
+  if (!traceId) {
+    return;
+  }
+
+  try {
+    console.info("[DEBUG-XVDL-PERF]", itemId, traceId, event, details);
+  } catch (_error) {
+    // Diagnostics must never affect the transcript result.
+  }
 }
 
 function getAdapterForButton(button) {
@@ -832,10 +915,17 @@ function upsertTranscriptTask(meta, stage = "queued") {
       meta: { ...meta },
       text: "",
       status: "",
+      baseStatus: "",
       kind: "queued",
       done: false,
       expanded: false,
+      stage: "queued",
+      stageStartedAt: 0,
+      estimatedTotalMs: 0,
       feedbackTimer: null,
+      actionFeedback: null,
+      actionFeedbackTimer: null,
+      autoCloseAt: 0,
       card: null
     };
     transcriptTasks.set(itemId, task);
@@ -843,7 +933,12 @@ function upsertTranscriptTask(meta, stage = "queued") {
     task.meta = { ...task.meta, ...meta };
     task.text = "";
     task.done = false;
+    task.expanded = false;
     window.clearTimeout(task.feedbackTimer);
+    window.clearTimeout(task.actionFeedbackTimer);
+    task.actionFeedback = null;
+    task.autoCloseAt = 0;
+    syncAutoCloseTicker();
   }
 
   applyTranscriptTaskStage(task, stage);
@@ -866,8 +961,13 @@ function applyTranscriptTaskStage(task, stage, details = {}) {
   const attempt = Number(details.attempt || 0);
   const maxAttempts = Number(details.maxAttempts || 0);
   const suffix = attempt > 1 && maxAttempts > 1 ? ` (${attempt}/${maxAttempts})` : "";
-  task.status = `${stageInfo.text}${suffix}`;
+  task.stage = String(stage || "queued");
+  task.stageStartedAt = Date.now();
+  task.estimatedTotalMs = Math.max(0, Number(details.estimatedTotalMs || 0));
+  task.baseStatus = `${stageInfo.text}${suffix}`;
+  task.status = formatTaskStatus(task);
   task.kind = stageInfo.kind;
+  syncEtaTicker();
 }
 
 function completeTranscriptTask(itemId, text, cached) {
@@ -880,7 +980,11 @@ function completeTranscriptTask(itemId, text, cached) {
   task.status = cached ? "Saved transcript ready" : "Transcript ready";
   task.kind = "done";
   task.done = true;
+  task.stage = "done";
+  task.estimatedTotalMs = 0;
+  syncEtaTicker();
   renderTranscriptTask(task);
+  scheduleTaskAutoClose(task);
 }
 
 function failTranscriptTask(itemId, message) {
@@ -892,6 +996,9 @@ function failTranscriptTask(itemId, message) {
   task.status = String(message || "Transcription failed").replace(/^Failed(?: \[[^\]]+\])?:\s*/i, "");
   task.kind = "error";
   task.done = false;
+  task.stage = "error";
+  task.estimatedTotalMs = 0;
+  syncEtaTicker();
   renderTranscriptTask(task);
 }
 
@@ -918,6 +1025,119 @@ function setTranscriptTaskFeedback(itemId, text, restoreAfterMs = 0, kind = "don
   }
 }
 
+function formatTaskStatus(task, now = Date.now()) {
+  if (!ETA_STAGES.has(task.stage) || task.estimatedTotalMs <= 0) {
+    return task.baseStatus;
+  }
+  const elapsedMs = Math.max(0, now - task.stageStartedAt);
+  if (task.stage === "transcribing" && elapsedMs > task.estimatedTotalMs * 3) {
+    return "Spokenly is unusually slow — restart Spokenly before retrying";
+  }
+  const remainingMs = task.estimatedTotalMs - elapsedMs;
+  if (remainingMs <= 0) {
+    return `${task.baseStatus} (finishing…)`;
+  }
+  return `${task.baseStatus} (~${formatEtaDuration(remainingMs)} left)`;
+}
+
+function formatEtaDuration(milliseconds) {
+  const seconds = Math.max(1, Math.ceil(Number(milliseconds || 0) / 1000));
+  if (seconds < 90) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+}
+
+function syncEtaTicker() {
+  const hasActiveEta = Array.from(transcriptTasks.values()).some((task) => {
+    return ETA_STAGES.has(task.stage) && task.estimatedTotalMs > 0;
+  });
+  if (hasActiveEta && etaTickTimer === null) {
+    etaTickTimer = window.setInterval(updateEtaCountdowns, 1000);
+    return;
+  }
+  if (!hasActiveEta && etaTickTimer !== null) {
+    window.clearInterval(etaTickTimer);
+    etaTickTimer = null;
+  }
+}
+
+function updateEtaCountdowns() {
+  const now = Date.now();
+  for (const task of transcriptTasks.values()) {
+    if (!ETA_STAGES.has(task.stage) || task.estimatedTotalMs <= 0) {
+      continue;
+    }
+    const status = formatTaskStatus(task, now);
+    if (status === task.status) {
+      continue;
+    }
+    task.status = status;
+    const ui = task.card?._xvdlTaskUi;
+    if (ui) {
+      ui.statusText.textContent = status;
+    }
+  }
+}
+
+async function scheduleTaskAutoClose(task) {
+  const data = await chrome.storage.local.get("transcriptSettings").catch(() => ({}));
+  if (!transcriptTasks.has(task.itemId) || !task.done) {
+    return;
+  }
+  const rawMinutes = Number(data?.transcriptSettings?.autoCloseMinutes);
+  const minutes = rawMinutes === 0
+    ? 0
+    : Number.isFinite(rawMinutes)
+      ? Math.min(7 * 24 * 60, Math.max(1, Math.floor(rawMinutes)))
+      : 5;
+  if (minutes === 0) {
+    return;
+  }
+  task.autoCloseAt = Date.now() + minutes * 60 * 1000;
+  renderTranscriptTask(task);
+  syncAutoCloseTicker();
+}
+
+function formatAutoCloseStatus(remainingMs) {
+  const totalSeconds = Math.max(0, Math.ceil(Number(remainingMs || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `Closes in ${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
+function syncAutoCloseTicker() {
+  const hasCountdown = Array.from(transcriptTasks.values()).some((task) => task.autoCloseAt > 0);
+  if (hasCountdown && autoCloseTickTimer === null) {
+    autoCloseTickTimer = window.setInterval(updateAutoCloseCountdowns, 1000);
+    return;
+  }
+  if (!hasCountdown && autoCloseTickTimer !== null) {
+    window.clearInterval(autoCloseTickTimer);
+    autoCloseTickTimer = null;
+  }
+}
+
+function updateAutoCloseCountdowns() {
+  const now = Date.now();
+  for (const task of Array.from(transcriptTasks.values())) {
+    if (task.autoCloseAt <= 0) {
+      continue;
+    }
+    if (now >= task.autoCloseAt) {
+      removeTranscriptTask(task);
+      continue;
+    }
+    const ui = task.card?._xvdlTaskUi;
+    if (ui) {
+      ui.autoCloseText.textContent = formatAutoCloseStatus(task.autoCloseAt - now);
+    }
+  }
+  syncAutoCloseTicker();
+}
+
 function renderTranscriptTask(task) {
   const stack = ensureTaskStack();
   if (!task.card) {
@@ -935,6 +1155,11 @@ function renderTranscriptTask(task) {
   const postActionLabel = task.expanded ? "Collapse post text" : "Expand full post text";
   ui.post.title = postActionLabel;
   ui.post.setAttribute("aria-label", postActionLabel);
+  const showAutoClose = task.done && task.autoCloseAt > 0;
+  ui.autoCloseText.hidden = !showAutoClose;
+  ui.autoCloseText.textContent = showAutoClose
+    ? formatAutoCloseStatus(task.autoCloseAt - Date.now())
+    : "";
   ui.statusText.textContent = task.status;
   ui.status.hidden = task.done && task.kind === "done";
   syncTaskAvatar(ui.avatarSlot, task.meta);
@@ -972,9 +1197,13 @@ function createTranscriptTaskCard(itemId) {
   authorHandle.className = "xvdl-task-author-handle";
   author.append(authorName, authorHandle);
 
+  const autoCloseText = document.createElement("span");
+  autoCloseText.className = "xvdl-task-auto-close";
+  autoCloseText.hidden = true;
+
   const close = createTaskButton(itemId, "close", "Close task", renderTaskActionIcon("close"));
   close.className = "xvdl-task-close";
-  head.append(avatarSlot, author, close);
+  head.append(avatarSlot, author, autoCloseText, close);
 
   const post = document.createElement("button");
   post.type = "button";
@@ -994,7 +1223,7 @@ function createTranscriptTaskCard(itemId) {
   const actions = document.createElement("div");
   actions.className = "xvdl-task-actions";
   card.append(head, post, status, actions);
-  card._xvdlTaskUi = { avatarSlot, authorName, authorHandle, post, status, statusText, actions };
+  card._xvdlTaskUi = { avatarSlot, authorName, authorHandle, autoCloseText, post, status, statusText, actions };
   return card;
 }
 
@@ -1053,14 +1282,58 @@ function getTaskFallbackHandle(meta) {
 function renderTaskActions(container, task) {
   const buttons = [];
   if (task.done) {
-    buttons.push(createTaskButton(task.itemId, "copy", "Copy transcript", renderTaskActionIcon("copy"), "Copy"));
-    buttons.push(createTaskButton(task.itemId, "download", "Download transcript", renderTaskActionIcon("download"), "Download"));
+    buttons.push(createTaskFeedbackButton(task, "copy"));
+    buttons.push(createTaskFeedbackButton(task, "download"));
   }
   if (task.meta.itemUrl) {
     buttons.push(createTaskButton(task.itemId, "open", "Open original post", renderTaskActionIcon("open"), "Open post"));
   }
   container.replaceChildren(...buttons);
   container.hidden = buttons.length === 0;
+}
+
+function createTaskFeedbackButton(task, action) {
+  const feedback = task.actionFeedback?.action === action ? task.actionFeedback.state : "idle";
+  const content = {
+    copy: {
+      idle: ["Copy transcript", "Copy", "copy"],
+      working: ["Copying transcript", "Copying…", "working"],
+      done: ["Copied to clipboard", "Copied", "done"],
+      error: ["Copy failed", "Failed", "error"]
+    },
+    download: {
+      idle: ["Download transcript", "Download", "download"],
+      working: ["Starting transcript download", "Starting…", "working"],
+      done: ["Transcript download started", "Started", "done"],
+      error: ["Download failed", "Failed", "error"]
+    }
+  }[action][feedback];
+  const button = createTaskButton(task.itemId, action, content[0], renderTaskActionIcon(content[2]), content[1]);
+  button.dataset.actionState = feedback;
+  button.disabled = task.actionFeedback?.state === "working";
+  return button;
+}
+
+function setTaskActionFeedback(task, action, state, restoreAfterMs = 0) {
+  window.clearTimeout(task.actionFeedbackTimer);
+  task.actionFeedback = { action, state };
+  const actions = task.card?._xvdlTaskUi?.actions;
+  if (actions) {
+    renderTaskActions(actions, task);
+  }
+
+  if (restoreAfterMs > 0) {
+    task.actionFeedbackTimer = window.setTimeout(() => {
+      if (!transcriptTasks.has(task.itemId)) {
+        return;
+      }
+      task.actionFeedback = null;
+      const currentActions = task.card?._xvdlTaskUi?.actions;
+      if (currentActions) {
+        renderTaskActions(currentActions, task);
+      }
+    }, restoreAfterMs);
+  }
 }
 
 function createTaskButton(itemId, action, title, icon, label = "") {
@@ -1081,6 +1354,15 @@ function createTaskButton(itemId, action, title, icon, label = "") {
 }
 
 function renderTaskActionIcon(action) {
+  if (action === "working") {
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"></path></svg>';
+  }
+  if (action === "done") {
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"></path></svg>';
+  }
+  if (action === "error") {
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"></path></svg>';
+  }
   if (action === "copy") {
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>';
   }
@@ -1106,13 +1388,7 @@ async function handleTaskPanelAction(itemId, action) {
   }
 
   if (action === "close") {
-    window.clearTimeout(task.feedbackTimer);
-    task.card?.remove();
-    transcriptTasks.delete(task.itemId);
-    const stack = document.querySelector(`.${TASK_STACK_CLASS}`);
-    if (stack && !transcriptTasks.size) {
-      stack.remove();
-    }
+    removeTranscriptTask(task);
     return;
   }
 
@@ -1127,14 +1403,16 @@ async function handleTaskPanelAction(itemId, action) {
 
   try {
     if (action === "copy") {
+      setTaskActionFeedback(task, "copy", "working");
       const text = task.text || await fetchTranscriptTaskText(task);
       await copyTextToClipboard(text);
       task.text = text;
-      setTranscriptTaskFeedback(task.itemId, "Copied to clipboard", 1800);
+      setTaskActionFeedback(task, "copy", "done", 1800);
       return;
     }
 
     if (action === "download") {
+      setTaskActionFeedback(task, "download", "working");
       const response = await sendRuntimeMessage({
         type: "DOWNLOAD_ITEM_TRANSCRIPT",
         itemId: task.itemId,
@@ -1148,11 +1426,28 @@ async function handleTaskPanelAction(itemId, action) {
       if (!response?.ok) {
         throw new Error(response?.error || "Could not download transcript.");
       }
-      setTranscriptTaskFeedback(task.itemId, "Transcript download started", 1800);
+      setTaskActionFeedback(task, "download", "done", 1800);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (action === "copy" || action === "download") {
+      setTaskActionFeedback(task, action, "error", 2400);
+    }
     setTranscriptTaskFeedback(task.itemId, message || "Action failed", 2600, "error");
+  }
+}
+
+function removeTranscriptTask(task) {
+  window.clearTimeout(task.feedbackTimer);
+  window.clearTimeout(task.actionFeedbackTimer);
+  task.autoCloseAt = 0;
+  task.card?.remove();
+  transcriptTasks.delete(task.itemId);
+  syncEtaTicker();
+  syncAutoCloseTicker();
+  const stack = document.querySelector(`.${TASK_STACK_CLASS}`);
+  if (stack && !transcriptTasks.size) {
+    stack.remove();
   }
 }
 

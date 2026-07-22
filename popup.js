@@ -33,6 +33,9 @@ const elements = {
   retentionUnit: document.getElementById("retentionUnit"),
   includeTitleInput: document.getElementById("includeTitleInput"),
   timestampModeSelect: document.getElementById("timestampModeSelect"),
+  autoCloseSelect: document.getElementById("autoCloseSelect"),
+  autoCloseCustomField: document.getElementById("autoCloseCustomField"),
+  autoCloseCustomInput: document.getElementById("autoCloseCustomInput"),
   saveSettingsBtn: document.getElementById("saveSettingsBtn"),
   themeButton: document.getElementById("themeButton"),
   languageButton: document.getElementById("languageButton"),
@@ -218,6 +221,8 @@ function bindEvents() {
     });
   });
 
+  elements.autoCloseSelect.addEventListener("change", renderAutoCloseCustomField);
+
   elements.saveSettingsBtn.addEventListener("click", async () => {
     if (isBusy) {
       return;
@@ -229,13 +234,17 @@ function bindEvents() {
       const rawRetention = clampInt(elements.retentionValue.value, 1, 30, 7);
       const unit = elements.retentionUnit.value === "hours" ? "hours" : "days";
       const retentionHours = unit === "hours" ? rawRetention : rawRetention * 24;
+      const autoCloseMinutes = elements.autoCloseSelect.value === "custom"
+        ? clampInt(elements.autoCloseCustomInput.value, 1, 7 * 24 * 60, 5)
+        : clampInt(elements.autoCloseSelect.value, 0, 60, 5);
       const response = await sendMessage({
         type: "UPDATE_TRANSCRIPT_SETTINGS",
         settings: {
           maxItems,
           retentionHours,
           includeTitle: elements.includeTitleInput.checked,
-          timestampMode: elements.timestampModeSelect.value
+          timestampMode: elements.timestampModeSelect.value,
+          autoCloseMinutes
         }
       });
 
@@ -459,6 +468,12 @@ function renderSettings(settings) {
   const knownMode = Array.from(elements.timestampModeSelect.options).some((option) => option.value === mode);
   elements.timestampModeSelect.value = knownMode ? mode : "off";
 
+  const autoCloseMinutes = clampInt(settings?.autoCloseMinutes, 0, 7 * 24 * 60, 5);
+  const preset = [0, 1, 5, 15, 30, 60].includes(autoCloseMinutes);
+  elements.autoCloseSelect.value = preset ? String(autoCloseMinutes) : "custom";
+  elements.autoCloseCustomInput.value = String(preset ? 5 : autoCloseMinutes);
+  renderAutoCloseCustomField();
+
   if (retentionHours % 24 === 0) {
     elements.retentionValue.value = String(Math.max(1, Math.floor(retentionHours / 24)));
     elements.retentionUnit.value = "days";
@@ -466,6 +481,10 @@ function renderSettings(settings) {
     elements.retentionValue.value = String(retentionHours);
     elements.retentionUnit.value = "hours";
   }
+}
+
+function renderAutoCloseCustomField() {
+  elements.autoCloseCustomField.hidden = elements.autoCloseSelect.value !== "custom";
 }
 
 function renderHistory(items) {

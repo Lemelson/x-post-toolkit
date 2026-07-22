@@ -41,6 +41,7 @@ export async function runNativeTranscription(itemId, mp4Url, options = {}) {
     preview: String(response.preview || ""),
     elapsedMs: Number(response.elapsedMs || 0),
     downloadElapsedMs: Number(response.downloadElapsedMs || 0),
+    queueElapsedMs: Number(response.queueElapsedMs || 0),
     asrElapsedMs: Number(response.asrElapsedMs || 0),
     validationVersion: Number(response.validationVersion || 0),
     expectedDurationMs: Number(response.expectedDurationMs || 0),

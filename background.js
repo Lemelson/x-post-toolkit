@@ -1,7 +1,13 @@
 "use strict";
 
 import { getItemContext, normalizeItemId } from "./src/background/context.js";
+import {
+  createPerfTrace,
+  markPerfTrace,
+  persistPerfTrace
+} from "./src/background/diagnostics.js";
 import { startTranscriptDownload, startVideoDownload } from "./src/background/downloads.js";
+import { estimateEtaMs, getEtaStats, isPhaseSlowdown, recordEtaSample } from "./src/background/eta.js";
 import { buildSrt, buildTranscriptOutput } from "./src/background/format.js";
 import { resolveBestMedia, resolveMediaCandidates } from "./src/background/media.js";
 import { debugNativeHost, runNativeTranscription } from "./src/background/native.js";
@@ -16,7 +22,6 @@ import {
 
 const HOUR_MS = 60 * 60 * 1000;
 
-let transcriptQueue = Promise.resolve();
 const inFlightTranscripts = new Map();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -90,23 +95,34 @@ async function handleDownloadMessage(message) {
 
 async function handleTranscriptMessage(message, sender) {
   const context = getItemContext(message);
+  const trace = createPerfTrace(context.itemId);
+  markPerfTrace(trace, "background_request_received", {
+    platform: context.platform,
+    fromTab: Number.isInteger(sender?.tab?.id)
+  });
   const tabId = sender?.tab?.id;
   const onProgress = Number.isInteger(tabId)
     ? (stage) => sendProgressToTab(tabId, context.itemId, stage)
     : null;
   const now = Date.now();
   const store = await getPrunedStore();
+  markPerfTrace(trace, "initial_store_loaded", {
+    historyItems: store.history.length
+  });
   const cached = store.byId?.[context.itemId] || null;
   const cacheTtlMs = getCacheTtlMs(store.settings);
 
   if (isTranscriptCacheUsable(cached, now, cacheTtlMs)) {
+    markPerfTrace(trace, "verified_cache_hit");
     const leftMs = cacheTtlMs - (now - Number(cached.updatedAt || 0));
     const merged = mergeEntryMeta(cached, context);
     if (shouldPatchMeta(cached, context)) {
+      markPerfTrace(trace, "cache_metadata_save_started");
       await saveTranscriptEntry(merged, store.settings);
+      markPerfTrace(trace, "cache_metadata_save_finished");
     }
 
-    return {
+    const result = {
       ok: true,
       cached: true,
       itemId: context.itemId,
@@ -114,37 +130,51 @@ async function handleTranscriptMessage(message, sender) {
       text: buildTranscriptOutput(merged, store.settings),
       chars: Number(cached.chars || 0),
       preview: String(cached.preview || ""),
-      cacheTtlSec: Math.max(0, Math.floor(leftMs / 1000))
+      cacheTtlSec: Math.max(0, Math.floor(leftMs / 1000)),
+      debugTraceId: trace.traceId
     };
+    markPerfTrace(trace, "background_response_ready", { cached: true });
+    void persistPerfTrace(trace).catch(() => undefined);
+    return result;
   }
   if (cached?.text && now - Number(cached.updatedAt || 0) < cacheTtlMs) {
     onProgress?.({ stage: "invalid-cache" });
   }
 
-  if (!inFlightTranscripts.has(context.itemId) && inFlightTranscripts.size > 0) {
-    onProgress?.({ stage: "queued" });
-  }
-
-  await badgeJobStarted();
+  markPerfTrace(trace, "badge_start_started");
+  badgeJobStarted();
+  markPerfTrace(trace, "badge_start_finished");
 
   try {
-    const result = await enqueueTranscript(context, store.settings, onProgress);
-    await badgeJobFinished(true);
-    return result;
+    const result = await getOrStartTranscript(context, store, onProgress, trace);
+    markPerfTrace(trace, "badge_finish_started");
+    badgeJobFinished(true);
+    markPerfTrace(trace, "badge_finish_finished");
+    markPerfTrace(trace, "background_response_ready", {
+      cached: result.cached === true,
+      chars: result.chars
+    });
+    void persistPerfTrace(trace).catch(() => undefined);
+    return { ...result, debugTraceId: trace.traceId };
   } catch (error) {
-    await badgeJobFinished(false);
+    markPerfTrace(trace, "background_failed", {
+      code: error?.code ? String(error.code) : "",
+      message: error instanceof Error ? error.message : String(error)
+    });
+    badgeJobFinished(false);
+    void persistPerfTrace(trace).catch(() => undefined);
     throw error;
   }
 }
 
-function enqueueTranscript(context, settings, onProgress) {
+function getOrStartTranscript(context, store, onProgress, trace) {
   const existing = inFlightTranscripts.get(context.itemId);
   if (existing) {
+    markPerfTrace(trace, "joined_existing_transcription");
     return existing;
   }
 
-  const job = transcriptQueue.then(() => runTranscriptJob(context, settings, onProgress));
-  transcriptQueue = job.catch(() => undefined);
+  const job = runTranscriptJob(context, store, onProgress, trace);
 
   const tracked = job.finally(() => {
     inFlightTranscripts.delete(context.itemId);
@@ -153,12 +183,12 @@ function enqueueTranscript(context, settings, onProgress) {
   return tracked;
 }
 
-async function runTranscriptJob(context, settings, onProgress) {
+async function runTranscriptJob(context, store, onProgress, trace) {
   const now = Date.now();
-  const store = await getPrunedStore(settings);
   const cached = store.byId?.[context.itemId] || null;
   const cacheTtlMs = getCacheTtlMs(store.settings);
   if (isTranscriptCacheUsable(cached, now, cacheTtlMs)) {
+    markPerfTrace(trace, "job_verified_cache_hit");
     const merged = mergeEntryMeta(cached, context);
     return {
       ok: true,
@@ -172,8 +202,12 @@ async function runTranscriptJob(context, settings, onProgress) {
     };
   }
 
+  markPerfTrace(trace, "media_resolution_started");
   const candidates = await resolveMediaCandidates(context, "transcript");
-  const transcriptResult = await transcribeWithFallback(context, candidates, onProgress);
+  markPerfTrace(trace, "media_resolution_finished", {
+    candidates: candidates.length
+  });
+  const transcriptResult = await transcribeWithFallback(context, candidates, onProgress, trace);
   const media = transcriptResult.media;
   const transcript = transcriptResult.transcript;
   const entry = {
@@ -199,14 +233,42 @@ async function runTranscriptJob(context, settings, onProgress) {
   };
 
   if (!isTranscriptVerified(entry)) {
+    markPerfTrace(trace, "transcript_verification_failed");
     const error = new Error(
       "Native host returned an incomplete or unverified transcript. Reinstall the native host and retry."
     );
     error.code = "UNVERIFIED_TRANSCRIPT";
     throw error;
   }
+  markPerfTrace(trace, "transcript_verified", {
+    chars: transcript.charCount,
+    audioDurationMs: transcript.audioDurationMs,
+    transcriptEndMs: transcript.transcriptEndMs
+  });
 
-  await saveTranscriptEntry(entry, store.settings);
+  const persistenceTasks = [];
+  if (transcript.slowAsr) {
+    markPerfTrace(trace, "eta_sample_skipped_slow_asr", {
+      asrElapsedMs: transcript.asrElapsedMs,
+      expectedAsrMs: transcript.expectedAsrMs
+    });
+  } else {
+    markPerfTrace(trace, "eta_sample_save_started");
+    persistenceTasks.push(
+      recordEtaSample({
+        durationMs: transcript.audioDurationMs || transcript.expectedDurationMs || media.durationMs,
+        downloadElapsedMs: transcript.downloadElapsedMs,
+        asrElapsedMs: transcript.asrElapsedMs,
+        recordedAt: Date.now()
+      }).then(() => markPerfTrace(trace, "eta_sample_save_finished")).catch(() => undefined)
+    );
+  }
+  markPerfTrace(trace, "transcript_history_save_started");
+  persistenceTasks.push(
+    saveTranscriptEntry(entry, store.settings)
+      .then(() => markPerfTrace(trace, "transcript_history_save_finished"))
+  );
+  await Promise.all(persistenceTasks);
 
   return {
     ok: true,
@@ -232,7 +294,10 @@ async function runTranscriptJob(context, settings, onProgress) {
     complete: transcript.complete,
     expectedDurationMs: transcript.expectedDurationMs,
     audioDurationMs: transcript.audioDurationMs,
-    transcriptEndMs: transcript.transcriptEndMs
+    transcriptEndMs: transcript.transcriptEndMs,
+    slowAsr: transcript.slowAsr === true,
+    expectedAsrMs: Number(transcript.expectedAsrMs || 0),
+    asrElapsedMs: Number(transcript.asrElapsedMs || 0)
   };
 }
 
@@ -402,38 +467,96 @@ function sendProgressToTab(tabId, itemId, progress) {
 // transcripts do not clear or overwrite each other's status.
 let activeBadgeJobs = 0;
 
-async function setGlobalBadge(text, color) {
-  await chrome.action.setBadgeBackgroundColor({ color });
-  await chrome.action.setBadgeText({ text });
+async function showActiveBadge() {
+  await chrome.action.setBadgeBackgroundColor({ color: "#1d9bf0" });
+  if (activeBadgeJobs <= 0) {
+    return;
+  }
+  await chrome.action.setBadgeText({ text: "TXT" });
+  if (activeBadgeJobs <= 0) {
+    await chrome.action.setBadgeText({ text: "" });
+  }
 }
 
-async function badgeJobStarted() {
+function badgeJobStarted() {
   activeBadgeJobs += 1;
-  await setGlobalBadge("TXT", "#1d9bf0");
+  void showActiveBadge().catch(() => undefined);
 }
 
-async function badgeJobFinished(_ok) {
+function badgeJobFinished(_ok) {
   activeBadgeJobs = Math.max(0, activeBadgeJobs - 1);
   if (activeBadgeJobs > 0) {
     return;
   }
   // Service-worker timers are not durable. Clear immediately once the last
   // job finishes so an OK/ERR badge cannot remain stuck after worker shutdown.
-  await chrome.action.setBadgeText({ text: "" });
+  void chrome.action.setBadgeText({ text: "" }).catch(() => undefined);
 }
 
-async function transcribeWithFallback(context, candidates, onProgress) {
+async function transcribeWithFallback(context, candidates, onProgress, trace) {
   let lastError = null;
+  const etaStats = await getEtaStats().catch(() => ({ version: 1, samples: [] }));
+  markPerfTrace(trace, "eta_stats_loaded", {
+    samples: etaStats.samples.length
+  });
 
-  for (const media of candidates) {
+  for (const [candidateIndex, media] of candidates.entries()) {
     try {
-      const transcript = await runNativeTranscription(context.itemId, media.url, {
-        onProgress,
+      markPerfTrace(trace, "native_transcription_started", {
+        candidateIndex,
+        source: media.source,
         expectedDurationMs: media.durationMs
       });
-      return { media, transcript };
+      const transcript = await runNativeTranscription(context.itemId, media.url, {
+        onProgress: (progress) => {
+          const details = withEta(progress, media.durationMs, etaStats);
+          markPerfTrace(trace, `native_progress_${details.stage || "unknown"}`, {
+            attempt: Number(details.attempt || 0),
+            maxAttempts: Number(details.maxAttempts || 0),
+            audioDurationMs: Number(details.audioDurationMs || 0),
+            downloadElapsedMs: Number(details.downloadElapsedMs || 0),
+            queueElapsedMs: Number(details.queueElapsedMs || 0)
+          });
+          onProgress?.(details);
+        },
+        expectedDurationMs: media.durationMs
+      });
+      markPerfTrace(trace, "native_transcription_finished", {
+        elapsedMs: transcript.elapsedMs,
+        downloadElapsedMs: transcript.downloadElapsedMs,
+        queueElapsedMs: transcript.queueElapsedMs,
+        asrElapsedMs: transcript.asrElapsedMs,
+        chars: transcript.charCount
+      });
+      const durationMs = Number(transcript.audioDurationMs || transcript.expectedDurationMs || media.durationMs || 0);
+      const expectedAsrMs = estimateEtaMs(etaStats, "transcription", durationMs);
+      const slowAsr = isPhaseSlowdown(
+        etaStats,
+        "transcription",
+        durationMs,
+        transcript.asrElapsedMs
+      );
+      if (slowAsr) {
+        markPerfTrace(trace, "slow_asr_detected", {
+          asrElapsedMs: transcript.asrElapsedMs,
+          expectedAsrMs
+        });
+      }
+      return {
+        media,
+        transcript: {
+          ...transcript,
+          slowAsr,
+          expectedAsrMs
+        }
+      };
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
+      markPerfTrace(trace, "native_transcription_failed", {
+        candidateIndex,
+        code: lastError.code ? String(lastError.code) : "",
+        message: lastError.message
+      });
       if (
         lastError.code === "FFMPEG_TIMEOUT" ||
         lastError.code === "DOWNLOAD_FAILED" ||
@@ -454,6 +577,27 @@ async function transcribeWithFallback(context, candidates, onProgress) {
     throw error;
   }
   throw new Error("No video candidates available for transcript.");
+}
+
+function withEta(progress, mediaDurationMs, stats) {
+  const details = progress && typeof progress === "object"
+    ? progress
+    : { stage: String(progress || "") };
+  const durationMs = Number(
+    details.audioDurationMs || details.expectedDurationMs || mediaDurationMs || 0
+  );
+  const stage = String(details.stage || "");
+  const phase = stage === "downloading"
+    ? "download"
+    : stage === "transcribing"
+      ? "transcription"
+      : null;
+  return {
+    ...details,
+    durationMs,
+    estimatedTotalMs: phase ? estimateEtaMs(stats, phase, durationMs) : 0,
+    etaSampleCount: stats.samples.length
+  };
 }
 
 function isRecoverableAudioError(error) {
