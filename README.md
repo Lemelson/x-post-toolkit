@@ -1,13 +1,46 @@
-# X Video Toolkit — one-click video download and local AI transcription
+<p align="center">
+  <img src="icons/icon-128.png" alt="X Video Toolkit" width="84" />
+</p>
 
-[![Chrome Extension](https://img.shields.io/badge/Chrome-Manifest%20V3-4285F4?logo=googlechrome&logoColor=white)](https://developer.chrome.com/docs/extensions/develop/migrate/what-is-mv3)
-[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-000000?logo=apple&logoColor=white)](https://support.apple.com/en-us/116943)
-[![NVIDIA Parakeet](https://img.shields.io/badge/ASR-NVIDIA%20Parakeet%20v3-76B900?logo=nvidia&logoColor=white)](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<h1 align="center">X Video Toolkit</h1>
 
-[Website](https://lemelson.github.io/x-post-toolkit/) ·
-[Setup guide](https://lemelson.github.io/x-post-toolkit/setup.html) ·
-[Privacy policy](https://lemelson.github.io/x-post-toolkit/privacy.html)
+<p align="center">
+  <strong>One-click X (Twitter) &amp; Google Drive video downloader with private local NVIDIA Parakeet v3 transcription.</strong><br/>
+  Runs 100% locally on Apple Silicon macOS via Spokenly + Core ML — zero cloud uploads, zero API keys.
+</p>
+
+<p align="center">
+  <a href="https://lemelson.github.io/x-post-toolkit/"><img src="https://img.shields.io/badge/Website-Overview-f97316?style=for-the-badge&logo=githubpages&logoColor=white" alt="Website" /></a>
+  <a href="https://lemelson.github.io/x-post-toolkit/setup.html"><img src="https://img.shields.io/badge/Setup_Guide-Apple_Silicon-1c1917?style=for-the-badge&logo=apple&logoColor=white" alt="Setup Guide" /></a>
+  <a href="#install-on-an-apple-silicon-mac"><img src="https://img.shields.io/badge/Install-Load_Unpacked-2563eb?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Install" /></a>
+</p>
+
+<p align="center">
+  <a href="https://developer.chrome.com/docs/extensions/develop/migrate/what-is-mv3"><img src="https://img.shields.io/badge/Chrome-Manifest%20V3-4285F4?style=flat-square&logo=googlechrome&logoColor=white" alt="Chrome Extension" /></a>
+  <a href="https://support.apple.com/en-us/116943"><img src="https://img.shields.io/badge/macOS-Apple%20Silicon-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS" /></a>
+  <a href="https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3"><img src="https://img.shields.io/badge/ASR-NVIDIA%20Parakeet%20v3-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="NVIDIA Parakeet" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License: MIT" /></a>
+</p>
+
+<p align="center">
+  <a href="https://lemelson.github.io/x-post-toolkit/">Website</a> ·
+  <a href="https://lemelson.github.io/x-post-toolkit/setup.html">Setup guide</a> ·
+  <a href="https://lemelson.github.io/x-post-toolkit/privacy.html">Privacy policy</a> ·
+  <a href="#install-on-an-apple-silicon-mac">Install</a> ·
+  <a href="#how-local-transcription-works">Architecture</a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/popup-showcase.png" alt="X Video Toolkit Popup UI — Home actions, Recent transcripts library, and Timestamp/Export settings" width="100%" />
+</p>
+
+<details>
+<summary><strong>Project Website &amp; Inline Workflow Preview</strong></summary>
+<br/>
+<p align="center">
+  <img src="docs/screenshots/website-preview.png" alt="X Video Toolkit website preview showing inline Download MP4 and Transcript buttons" width="92%" />
+</p>
+</details>
 
 **X Video Toolkit** is a privacy-first Chrome/Chromium extension that adds
 **Download** and **Transcript** buttons directly to supported X (Twitter) video
